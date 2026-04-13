@@ -54,11 +54,11 @@ img{max-width:100%;display:block}
 .hero-name{font-size:clamp(2rem,5vw,3.5rem);font-weight:700;letter-spacing:-.02em;margin-bottom:.4rem}
 .hero-name .accent{color:var(--accent-light)}
 .hero-title{font-size:1.25rem;font-weight:400;color:rgba(255,255,255,.8);margin-bottom:.6rem}
-.hero-subtitle{font-size:.95rem;color:rgba(255,255,255,.5);max-width:560px;margin:0 auto 2rem}
+.hero-subtitle{font-size:.95rem;color:rgba(255,255,255,.75);max-width:560px;margin:0 auto 2rem}
 .hero-social{display:flex;gap:1rem;justify-content:center;margin-bottom:3rem}
-.hero-social a{width:44px;height:44px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.2);border-radius:50%;font-size:1.1rem;color:rgba(255,255,255,.7);transition:all .25s}
+.hero-social a{width:44px;height:44px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.3);border-radius:50%;font-size:1.1rem;color:rgba(255,255,255,.85);transition:all .25s}
 .hero-social a:hover{background:var(--accent);border-color:var(--accent);color:#fff;transform:translateY(-3px)}
-.hero-scroll{display:inline-flex;color:rgba(255,255,255,.35);font-size:1.2rem;animation:bounce 2s infinite}
+.hero-scroll{display:inline-flex;color:rgba(255,255,255,.6);font-size:1.2rem;animation:bounce 2s infinite}
 @keyframes bounce{0%,100%{transform:translateY(0)}50%{transform:translateY(8px)}}
 
 /* ── Sections ── */
@@ -93,7 +93,7 @@ img{max-width:100%;display:block}
 .tl-header{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;margin-bottom:.8rem;flex-wrap:wrap}
 .tl-header h3{font-size:1.1rem;font-weight:600;color:var(--gray-800)}
 .tl-company{font-size:.9rem;color:var(--accent);font-weight:500}
-.tl-date{font-size:.8rem;color:var(--gray-400);white-space:nowrap;font-weight:500;flex-shrink:0}
+.tl-date{font-size:.8rem;color:var(--gray-600);white-space:nowrap;font-weight:500;flex-shrink:0}
 .tl-content ul{margin-bottom:.8rem}
 .tl-content li{font-size:.88rem;color:var(--gray-600);padding-left:1rem;position:relative;margin-bottom:.35rem}
 .tl-content li::before{content:'';position:absolute;left:0;top:.55em;width:5px;height:5px;border-radius:50%;background:var(--gray-400)}
@@ -120,7 +120,7 @@ img{max-width:100%;display:block}
 .edu-icon{width:56px;height:56px;display:flex;align-items:center;justify-content:center;background:var(--accent-bg);color:var(--accent);border-radius:50%;margin:0 auto 1rem;font-size:1.3rem}
 .edu-card h3{font-size:1rem;font-weight:600;margin-bottom:.3rem}
 .edu-school{color:var(--accent);font-weight:500;font-size:.9rem}
-.edu-period{color:var(--gray-400);font-size:.8rem;margin-top:.2rem}
+.edu-period{color:var(--gray-600);font-size:.8rem;margin-top:.2rem}
 
 /* ── Projects ── */
 .projects-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1.2rem}
@@ -129,7 +129,7 @@ a.project-card{cursor:pointer}
 .project-card.visible{opacity:1;transform:translateY(0)}
 .project-card:hover{box-shadow:var(--shadow-lg);border-color:transparent;transform:translateY(-2px) !important}
 .project-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem;color:var(--accent);font-size:1.2rem}
-.project-stars{font-size:.78rem;color:var(--gray-400);display:flex;align-items:center;gap:.3rem}
+.project-stars{font-size:.78rem;color:var(--gray-600);display:flex;align-items:center;gap:.3rem}
 .project-stars i{color:#eab308;font-size:.7rem}
 .project-card h4{font-size:1rem;font-weight:600;margin-bottom:.4rem;font-family:'JetBrains Mono','Fira Code',monospace}
 .project-card p{font-size:.85rem;color:var(--gray-600);margin-bottom:.8rem}
@@ -167,10 +167,10 @@ a.project-card{cursor:pointer}
 .contact-card:hover{box-shadow:var(--shadow-lg);border-color:transparent;transform:translateY(-3px) !important}
 .contact-card i{font-size:1.6rem;color:var(--accent);margin-bottom:.8rem}
 .contact-card strong{font-size:.9rem;margin-bottom:.2rem}
-.contact-card span{font-size:.8rem;color:var(--gray-400)}
+.contact-card span{font-size:.8rem;color:var(--gray-600)}
 
 /* ── Footer ── */
-.footer{padding:2rem 0;text-align:center;border-top:1px solid var(--gray-200);color:var(--gray-400);font-size:.85rem}
+.footer{padding:2rem 0;text-align:center;border-top:1px solid var(--gray-200);color:var(--gray-600);font-size:.85rem}
 
 /* ── Responsive ── */
 @media(max-width:900px){

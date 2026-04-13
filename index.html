@@ -61,9 +61,12 @@
 
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"/>
+  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap" onload="this.onload=null;this.rel='stylesheet'"/>
+  <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap"/></noscript>
+  <link rel="preload" as="style" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" onload="this.onload=null;this.rel='stylesheet'"/>
+  <noscript><link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"/></noscript>
   <link rel="stylesheet" href="assets/css/site.css"/>
+  <meta name="theme-color" content="#0f172a"/>
 
   <!-- Google Analytics (GA4) -->
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-9FZCMZNK0T"></script>
@@ -104,7 +107,7 @@
   </div>
   <div class="container hero-content">
     <div class="hero-avatar">
-      <img src="https://s.gravatar.com/avatar/cf23188a6138c6a36bdd3eeb9279f2c0?s=200" alt="Orlando Burli Junior"/>
+      <img src="https://s.gravatar.com/avatar/cf23188a6138c6a36bdd3eeb9279f2c0?s=200" alt="Orlando Burli Junior" width="200" height="200" fetchpriority="high"/>
     </div>
     <h1 class="hero-name">Orlando Burli <span class="accent">Junior</span></h1>
     <p class="hero-title">Senior Software Engineer</p>
