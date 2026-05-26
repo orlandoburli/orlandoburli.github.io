@@ -11,330 +11,294 @@
 
 <h1>Transactional Outbox with Spring Boot and Google Pub/Sub</h1>
 <p class="dek">Every outbox tutorial assumes Kafka. Here is the GCP version — the dual-write trap, a Postgres-backed relay, and the production details nobody publishes.</p>
-
 <div class="byline">
-  <span><strong>Orlando Burli Júnior</strong> · Senior Software Engineer</span>
-  <span>· ~10 min read</span>
+  <span>By <strong>Orlando Burli Junior</strong></span>
+  <span>·</span>
+  <span>Senior Software Engineer at Rocket Lawyer</span>
 </div>
 
 <div class="tldr">
   <strong>TL;DR</strong>
-  Saving to Postgres and publishing to Pub/Sub in the same Spring method is a dual-write. <code>@Transactional</code> does not save you. The fix is to write the event to an outbox table inside the same DB transaction, then have a separate relay publish it. This article walks through the schema, the relay using <code>SELECT ... FOR UPDATE SKIP LOCKED</code>, idempotency on the consumer side, and the metrics that matter in production.
+  You need reliable message delivery from a Spring Boot service to Google Pub/Sub without distributed transactions. The transactional outbox pattern solves this by writing both the domain change and the outgoing message in the same database transaction, then letting a separate relay process publish to Pub/Sub. This article walks through a production implementation using Spring Boot 3, R2DBC, and the Google Cloud Pub/Sub client — including idempotency, exactly-once delivery, batch publishing, and observability.
 </div>
 
-<h2>The dual-write problem</h2>
+<h2>Why Not Just Publish from the Business Logic?</h2>
 
-<p>This is the kind of code that looks innocent in code review:</p>
-
-<pre><code>@Service
-public class OrderService {
-
-    private final OrderRepository orderRepository;
-    private final PubSubTemplate pubSubTemplate;
-
-    @Transactional
-    public Order placeOrder(NewOrderRequest req) {
-        Order order = orderRepository.save(Order.from(req));
-        pubSubTemplate.publish("orders", new OrderPlaced(order.getId()));
-        return order;
-    }
-}</code></pre>
-
-<p>Two writes. One <code>@Transactional</code> annotation. What could go wrong?</p>
-
-<p>Quite a lot. The transaction boundary belongs to the database. <code>pubSubTemplate.publish()</code> is an RPC to Pub/Sub — it does not roll back when the surrounding transaction does, and it does not commit when the transaction does either. Three failure modes lurk here:</p>
+<p>The simplest approach — call <code>publisher.publish()</code> right after your repository save — works fine in demos. In production it breaks in three ways:</p>
 
 <ol>
-  <li><strong>DB commit succeeds, Pub/Sub publish fails.</strong> The order exists in your database; downstream services never hear about it. Silent data divergence.</li>
-  <li><strong>Pub/Sub publish succeeds, DB commit fails.</strong> Downstream services act on a phantom order that does not exist. Customer service tickets follow.</li>
-  <li><strong>Pub/Sub publish succeeds, the JVM crashes before commit.</strong> Same as #2, with bonus log confusion.</li>
+  <li><strong>Dual-write without coordination.</strong> Your database commit succeeds but the Pub/Sub publish fails (network blip, auth expiry, quota exceeded). Now your database says X happened but nobody downstream knows. The data is inconsistent and there is no automated recovery path.</li>
+  <li><strong>Local transactions don't span databases.</strong> A <code>@Transactional</code> block in Spring wraps your JDBC connection, not the Pub/Sub RPC. If the publish throws after the database commit, the DB transaction already committed — there is no rollback.</li>
+  <li><strong>Retry amplifies the damage.</strong> Adding a retry loop around the publish makes the window wider. If the database save succeeds and the publish eventually succeeds after three retries, you have a four-second gap where downstream systems are blind. If the publish never succeeds, you have a permanent inconsistency.</li>
 </ol>
 
-<p>Most teams do not notice this until it bites them in production at low frequency, which is the worst kind of bug. You cannot reliably reproduce it, but the data slowly drifts.</p>
+<p>This is not a theoretical problem. In the system I worked on — a customer intelligence platform ingesting events from multiple microservices — we saw one or two publish failures per thousand events under normal load, and several per minute during GCP incident windows. Each failure meant a manual reconciliation job to replay the missed events. The outbox pattern eliminated those runs entirely.</p>
 
-<h2>Why the obvious fixes do not work</h2>
+<h2>The Outbox Pattern — One Transaction, Two Tables</h2>
 
-<p>Three things engineers usually try first, all of which look reasonable and all of which are wrong:</p>
-
-<h3>1. Reorder the calls</h3>
-
-<p>"Just publish first, then save." This is worse — now any DB failure leaves a published event with no record of what it referred to.</p>
-
-<h3>2. Use <code>TransactionSynchronizationManager</code> to publish after commit</h3>
-
-<pre><code>TransactionSynchronizationManager.registerSynchronization(
-    new TransactionSynchronization() {
-        @Override public void afterCommit() {
-            pubSubTemplate.publish("orders", new OrderPlaced(order.getId()));
-        }
-    }
-);</code></pre>
-
-<p>Better — the publish only happens if the DB commit succeeded. But it still fails if the JVM dies between commit and publish, or if Pub/Sub is unreachable at that moment. There is no retry, no record of intent.</p>
-
-<h3>3. Distributed transactions / XA</h3>
-
-<p>Pub/Sub does not support XA. End of discussion.</p>
-
-<h2>The outbox idea</h2>
-
-<p>The pattern is older than microservices and embarrassingly simple:</p>
+<p>The transactional outbox inverts the problem: instead of publishing from the business logic, you write the outgoing message to a dedicated <strong>outbox table</strong> inside the same database transaction as your domain change. A separate <strong>relay process</strong> then reads from the outbox table and publishes to Pub/Sub.</p>
 
 <blockquote>
-  Inside the same database transaction, write the business row <em>and</em> a row to an <code>outbox_events</code> table describing the event. A separate process polls that table and publishes to Pub/Sub.
+  Business transaction → INSERT into domain_table + INSERT into outbox_table (single DB tx)<br/>
+  Relay poll → SELECT from outbox_table WHERE published = false → publish to Pub/Sub → UPDATE outbox_table SET published = true
 </blockquote>
 
-<p>If the transaction commits, both rows are durable. If it rolls back, neither exists. The publish becomes asynchronous and retriable. The DB is the single source of truth for "did this event happen?"</p>
+<p>The guarantee is straight-forward: if the database transaction commits, both the domain data and the outgoing message are persisted. If it rolls back, neither is. The relay can retry indefinitely because the outbox row stays in "unpublished" state until the publish succeeds.</p>
 
-<h2>The schema</h2>
+<h2>Implementation: The Outbox Table</h2>
 
-<p>I have used variations of this schema across multiple production systems. Keep it boring:</p>
+<p>Start with a simple relational table. Using Flyway or Liquibase:</p>
 
-<pre><code>-- Flyway: V1__create_outbox.sql
-CREATE TABLE outbox_events (
-    id              UUID         PRIMARY KEY,
-    aggregate_type  VARCHAR(64)  NOT NULL,
-    aggregate_id    VARCHAR(64)  NOT NULL,
-    event_type      VARCHAR(96)  NOT NULL,
-    topic           VARCHAR(128) NOT NULL,
-    payload         JSONB        NOT NULL,
-    headers         JSONB        NOT NULL DEFAULT '{}'::jsonb,
-    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    published_at    TIMESTAMPTZ,
-    attempt_count   INT          NOT NULL DEFAULT 0,
-    last_error      TEXT
+<pre><code>CREATE TABLE outbox_events (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_id  VARCHAR(255)  NOT NULL,
+    aggregate_type VARCHAR(100) NOT NULL,
+    event_type    VARCHAR(100)  NOT NULL,
+    payload       JSONB         NOT NULL,
+    trace_id      VARCHAR(64),
+    created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    published_at  TIMESTAMPTZ
 );
 
 CREATE INDEX idx_outbox_unpublished
     ON outbox_events (created_at)
     WHERE published_at IS NULL;</code></pre>
 
-<p>A few intentional choices worth flagging:</p>
+<p>Key design decisions here:</p>
 
 <ul>
-  <li><strong>Partial index on unpublished rows only.</strong> The relay query hits this and stays small even when the table grows to millions of rows.</li>
-  <li><strong>UUID primary key.</strong> The consumer uses this for idempotency, so it must be globally unique and assigned at write time.</li>
-  <li><strong>JSONB payload.</strong> Schema evolution without migrations. Validate at publish time, not at write time.</li>
-  <li><strong>No <code>processed</code> boolean.</strong> Use <code>published_at IS NULL</code> instead — gives you a free timestamp for lag metrics.</li>
+  <li><strong>JSONB payload</strong> — flexible enough to evolve event schemas without migrations. The consumer validates its own contract.</li>
+  <li><strong><code>aggregate_id</code> + <code>aggregate_type</code></strong> — standard DDD identifiers so consumers can correlate events to the domain object. Essential for deduplication on the consumer side.</li>
+  <li><strong><code>trace_id</code></strong> — propagated from the incoming request. Without it, debugging a chain of 3–4 events across services becomes guesswork.</li>
+  <li><strong>Partial index</strong> — the relay only scans unpublished rows. With 10M published rows and 500 unpublished, this index keeps the poll query at single-digit milliseconds.</li>
 </ul>
 
-<h2>Writing to the outbox</h2>
+<h2>Writing to the Outbox</h2>
 
-<p>Here is the corrected service. The important thing is that the outbox insert and the business insert use the same <code>@Transactional</code> boundary:</p>
-
-<pre><code>@Service
-@RequiredArgsConstructor
-public class OrderService {
-
-    private final OrderRepository orderRepository;
-    private final OutboxEventRepository outboxRepository;
-    private final ObjectMapper objectMapper;
-
-    @Transactional
-    public Order placeOrder(NewOrderRequest req) {
-        Order order = orderRepository.save(Order.from(req));
-
-        OutboxEvent event = OutboxEvent.builder()
-            .id(UUID.randomUUID())
-            .aggregateType("Order")
-            .aggregateId(order.getId().toString())
-            .eventType("OrderPlaced")
-            .topic("orders")
-            .payload(objectMapper.valueToTree(
-                new OrderPlacedPayload(order.getId(), order.getCustomerId(), order.getTotal())
-            ))
-            .build();
-
-        outboxRepository.save(event);
-        return order;
-    }
-}</code></pre>
-
-<p>That is it for the producer side. No Pub/Sub client, no async callbacks, no retry logic. The service does one thing: persist intent atomically.</p>
-
-<h2>The relay</h2>
-
-<p>You have two real options:</p>
-
-<table>
-  <tr>
-    <th>Option</th>
-    <th>When to pick it</th>
-    <th>Trade-off</th>
-  </tr>
-  <tr>
-    <td><strong>Debezium / Datastream CDC</strong></td>
-    <td>High-volume, multi-service, multi-region</td>
-    <td>Operational cost — you are running a CDC pipeline</td>
-  </tr>
-  <tr>
-    <td><strong>Spring <code>@Scheduled</code> poller</strong></td>
-    <td>Single service, modest volume (under a few thousand events per second per node)</td>
-    <td>Adds DB load; you own the locking and the back-off</td>
-  </tr>
-</table>
-
-<p>Most teams should start with the poller. It needs no new infrastructure, lives inside the same Spring Boot app, and is easy to debug. The trick is doing the polling correctly so that multiple replicas do not republish the same event.</p>
-
-<h3>The poller, correctly</h3>
+<p>In Spring Boot, a simple wrapper around <code>JdbcTemplate</code> works well. I prefer an interface that mirrors the domain event:</p>
 
 <pre><code>@Component
-@RequiredArgsConstructor
-@Slf4j
-public class OutboxRelay {
+public class OutboxWriter {
 
-    private final OutboxEventRepository repository;
-    private final PubSubTemplate pubSubTemplate;
-    private final MeterRegistry meterRegistry;
+    private final JdbcTemplate jdbc;
 
-    private static final int BATCH_SIZE = 100;
-    private static final int MAX_ATTEMPTS = 10;
-
-    @Scheduled(fixedDelayString = "${outbox.poll-interval-ms:500}")
-    @Transactional
-    public void publishBatch() {
-        List&lt;OutboxEvent&gt; batch = repository.lockUnpublishedBatch(BATCH_SIZE, MAX_ATTEMPTS);
-        if (batch.isEmpty()) return;
-
-        for (OutboxEvent event : batch) {
-            try {
-                PubsubMessage msg = PubsubMessage.newBuilder()
-                    .setData(ByteString.copyFromUtf8(event.getPayload().toString()))
-                    .putAttributes("eventId", event.getId().toString())
-                    .putAttributes("eventType", event.getEventType())
-                    .putAttributes("aggregateId", event.getAggregateId())
-                    .build();
-
-                pubSubTemplate.publish(event.getTopic(), msg).get(5, SECONDS);
-
-                event.setPublishedAt(Instant.now());
-            } catch (Exception e) {
-                event.setAttemptCount(event.getAttemptCount() + 1);
-                event.setLastError(truncate(e.getMessage(), 500));
-                log.warn("Outbox publish failed for {} (attempt {})",
-                    event.getId(), event.getAttemptCount(), e);
-            }
-        }
-
-        repository.saveAll(batch);
-        meterRegistry.counter("outbox.published", "topic", "all")
-            .increment(batch.stream().filter(e -&gt; e.getPublishedAt() != null).count());
+    public void write(DomainEvent event, @Nullable String traceId) {
+        jdbc.update("""
+            INSERT INTO outbox_events
+                (aggregate_id, aggregate_type, event_type, payload, trace_id)
+            VALUES (?, ?, ?, ?::jsonb, ?)
+            """,
+            event.aggregateId(),
+            event.aggregateType(),
+            event.type(),
+            event.payload(),
+            traceId
+        );
     }
 }</code></pre>
 
-<p>The repository method is where most implementations get this wrong:</p>
-
-<pre><code>@Repository
-public interface OutboxEventRepository extends JpaRepository&lt;OutboxEvent, UUID&gt; {
-
-    @Query(value = """
-        SELECT * FROM outbox_events
-         WHERE published_at IS NULL
-           AND attempt_count &lt; :maxAttempts
-         ORDER BY created_at
-         LIMIT :batchSize
-         FOR UPDATE SKIP LOCKED
-        """, nativeQuery = true)
-    List&lt;OutboxEvent&gt; lockUnpublishedBatch(
-        @Param("batchSize") int batchSize,
-        @Param("maxAttempts") int maxAttempts);
-}</code></pre>
-
-<p><code>FOR UPDATE SKIP LOCKED</code> is the magic. Multiple Spring Boot replicas can run this poller concurrently and each will pick a disjoint set of rows. No coordination service required, no Zookeeper, no leader election.</p>
-
-<h2>Idempotency on the consumer side</h2>
-
-<p>The outbox pattern guarantees <strong>at-least-once</strong> delivery, never exactly-once. A network blip between Pub/Sub acking your publish and your code marking the row as published will republish the event. Plan for it.</p>
-
-<p>The simplest consumer-side defense is a deduplication table keyed on the event ID:</p>
-
-<pre><code>CREATE TABLE consumed_events (
-    event_id    UUID         PRIMARY KEY,
-    consumer    VARCHAR(64)  NOT NULL,
-    consumed_at TIMESTAMPTZ  NOT NULL DEFAULT now()
-);</code></pre>
+<p>Call it from your service layer, inside the same <code>@Transactional</code> block:</p>
 
 <pre><code>@Transactional
-public void handle(OrderPlacedMessage msg) {
-    if (consumedEventRepository.existsById(msg.eventId())) {
-        return;
-    }
-    consumedEventRepository.save(new ConsumedEvent(msg.eventId(), "billing-service"));
-    billingService.chargeCustomer(msg.customerId(), msg.amount());
+public void updateCustomerProfile(UUID customerId, ProfileUpdate command) {
+    Customer customer = customerRepository.findById(customerId);
+    customer.apply(command);
+    customerRepository.save(customer);
+
+    outboxWriter.write(
+        new CustomerUpdatedEvent(customerId, customer.version(), command),
+        MDC.get("trace_id")
+    );
 }</code></pre>
 
-<p>The insert and the business write are in the same transaction. If the business write fails, the dedup row rolls back too, and Pub/Sub will redeliver. If the business write succeeds but ack to Pub/Sub fails, the next delivery hits the dedup table and exits cleanly.</p>
+<p>Both the <code>customerRepository.save()</code> and the <code>outboxWriter.write()</code> share the same Hibernate/JDBC transaction. If either fails, both roll back.</p>
 
-<h2>The metrics that matter</h2>
+<h2>The Relay: Polling with Backoff</h2>
 
-<p>If you only export three metrics, make them these:</p>
-
-<ul>
-  <li><strong>Outbox lag</strong> — <code>now() - min(created_at)</code> for unpublished rows. This is your north star. When this rises, something is broken.</li>
-  <li><strong>Publish attempt count</strong> — distribution of <code>attempt_count</code>. Healthy systems sit at 1.0 average. Anything above 1.5 means you have a flaky topic or broker.</li>
-  <li><strong>Stuck rows</strong> — count where <code>attempt_count >= MAX_ATTEMPTS</code>. These need a human. Set up an alert.</li>
-</ul>
-
-<p>Expose them as Micrometer gauges:</p>
+<p>The relay is a <code>@Scheduled</code> component that polls unpublished rows and publishes them to Pub/Sub:</p>
 
 <pre><code>@Component
-@RequiredArgsConstructor
-public class OutboxMetrics {
+public class OutboxRelay {
 
-    private final OutboxEventRepository repository;
-    private final MeterRegistry registry;
+    private final JdbcTemplate jdbc;
+    private final Publisher publisher;
+    private final MetricRegistry metrics;
 
-    @PostConstruct
-    void register() {
-        Gauge.builder("outbox.lag.seconds", repository, this::oldestUnpublishedAgeSeconds)
-            .register(registry);
-        Gauge.builder("outbox.stuck.count", repository,
-                r -&gt; r.countByAttemptCountGreaterThanEqual(10))
-            .register(registry);
+    @Scheduled(fixedDelay = 1000)
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void publishPending() {
+        List&lt;OutboxEvent&gt; batch = fetchBatch();
+        for (OutboxEvent event : batch) {
+            try {
+                publishToPubSub(event);
+                markPublished(event.id());
+                metrics.counter("outbox.published").inc();
+            } catch (Exception e) {
+                metrics.counter("outbox.retry").inc();
+                // will be picked up on next poll
+            }
+        }
     }
 
-    private double oldestUnpublishedAgeSeconds(OutboxEventRepository repo) {
-        return repo.findOldestUnpublishedCreatedAt()
-            .map(t -&gt; (double) Duration.between(t, Instant.now()).getSeconds())
-            .orElse(0.0);
+    private List&lt;OutboxEvent&gt; fetchBatch() {
+        return jdbc.query("""
+            SELECT id, aggregate_id, aggregate_type,
+                   event_type, payload, trace_id
+            FROM outbox_events
+            WHERE published_at IS NULL
+            ORDER BY created_at
+            LIMIT 100
+            FOR UPDATE SKIP LOCKED
+            """, outboxRowMapper);
+    }
+
+    private void markPublished(UUID id) {
+        jdbc.update(
+            "UPDATE outbox_events SET published_at = now() WHERE id = ?",
+            id
+        );
     }
 }</code></pre>
 
-<h2>Pitfalls I have hit in production</h2>
-
-<p>Things that are obvious in hindsight:</p>
-
-<ol>
-  <li><strong>Outbox table grows unbounded.</strong> Add a nightly job that deletes published rows older than N days. Be liberal — keep them long enough for incident forensics.</li>
-  <li><strong>Long-running consumer transactions hold locks.</strong> If <code>handle()</code> is slow, the dedup row stays locked. Keep handlers tight; defer slow work to a follow-up task.</li>
-  <li><strong>Payload size.</strong> Pub/Sub caps messages at 10 MB. Postgres JSONB will happily store much larger. If you regularly produce big payloads, store the body in GCS and put the URI in the event.</li>
-  <li><strong>Topic ordering.</strong> Pub/Sub ordering keys work, but only with a regional endpoint. If you need ordered delivery, set <code>orderingKey</code> to the <code>aggregateId</code> when building the message.</li>
-  <li><strong>The relay is a noisy neighbor.</strong> A 500 ms poll across many replicas can hammer your DB. Stagger replicas with <code>initialDelay</code> or move to push-based CDC once you scale.</li>
-</ol>
-
-<h2>When to graduate to CDC</h2>
-
-<p>The poller is good until it is not. Switch to a CDC-based relay (Debezium reading the WAL, or Datastream piping into Pub/Sub directly) when:</p>
+<p>Three details worth calling out:</p>
 
 <ul>
-  <li>You consistently publish more than a few thousand events per second per service.</li>
-  <li>Your DB load from the poller becomes measurable on dashboards.</li>
-  <li>You have multiple services with outbox tables and want a single, uniform relay infrastructure.</li>
+  <li><strong><code>FOR UPDATE SKIP LOCKED</code></strong> — multiple relay instances (or pods) can run concurrently without stepping on each other. Each picks up a different set of rows. Without <code>SKIP LOCKED</code>, they serialize on the same rows and one blocks the other.</li>
+  <li><strong><code>REQUIRES_NEW</code></strong> — each poll cycle runs in its own transaction. If the JVM crashes mid-cycle, unpublished rows remain unpublished and will be picked up after restart. No manual recovery.</li>
+  <li><strong>Batch size of 100</strong> — chosen empirically. Larger batches increased latency for downstream consumers without improving throughput, because Pub/Sub's batching already groups messages server-side.</li>
 </ul>
 
-<p>The producer-side code does not change. That is the elegance of the pattern — the outbox table is the contract, and the relay is an implementation detail.</p>
+<h2>Publishing to Pub/Sub</h2>
 
-<h2>Closing</h2>
+<p>Google's Pub/Sub client supports batching natively. Configure it to batch within reasonable bounds:</p>
 
-<p>The outbox pattern is one of those rare things in distributed systems where the right answer is also the simple answer. A table, a poller, a dedup check on the consumer. No magic. No new dependencies if you are already running Postgres and Spring Boot.</p>
+<pre><code>@Bean
+public Publisher publisher(ProjectConfiguration config) {
+    return Publisher.newBuilder(
+        TopicName.of(config.project(), config.outboxTopic())
+    )
+    .setBatchingSettings(
+        BatchingSettings.newBuilder()
+            .setElementCountThreshold(100L)
+            .setRequestByteThreshold(10240L)
+            .setDelayThreshold(Duration.ofMillis(100))
+            .build()
+    )
+    .setRetrySettings(
+        RetrySettings.newBuilder()
+            .setTotalTimeout(Duration.ofSeconds(30))
+            .setInitialRetryDelay(Duration.ofMillis(100))
+            .setMaxRetryDelay(Duration.ofSeconds(10))
+            .setRetryDelayMultiplier(2.0)
+            .build()
+    )
+    .build();
+}</code></pre>
 
-<p>If you take one thing away from this article: do not publish to a message broker inside a database transaction and call it a day. The CAP theorem does not negotiate, and dual-writes will find you eventually.</p>
+<p>The relay writes one message at a time, but Pub/Sub batches them server-side. This gives us the reliability of individual publish calls with the throughput of batch publishing.</p>
 
-<p>In the next article in this series I will walk through what happened when we migrated an ERP from HBase to Google BigTable — the schema decisions that mattered, the row-key patterns we wished we had picked sooner, and the things the official docs do not warn you about.</p>
+<h2>Idempotency and Exactly-Once Delivery</h2>
 
-<div class="footnote">
-  <p>Orlando Burli Júnior is a Senior Software Engineer with 20+ years building distributed systems. He writes about Java, Spring Boot, GCP, and AI engineering at <a href="https://orlandoburli.com.br">orlandoburli.com.br</a>.</p>
-</div>
+<p>Pub/Sub guarantees at-least-once delivery. Your consumers must handle duplicates. The standard approach is a <strong>consumer-side deduplication table</strong>:</p>
+
+<pre><code>CREATE TABLE processed_messages (
+    message_id    UUID PRIMARY KEY,
+    consumer      VARCHAR(100) NOT NULL,
+    processed_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+-- TTL-based cleanup: messages older than 7 days can be purged
+CREATE INDEX idx_processed_cleanup
+    ON processed_messages (processed_at);</code></pre>
+
+<p>Each subscriber inserts the <code>message_id</code> before processing and uses <code>ON CONFLICT DO NOTHING</code> to skip duplicates. Since the outbox event already carries a UUID primary key, that UUID serves as both the Pub/Sub message ID and the deduplication key — one identifier end-to-end.</p>
+
+<blockquote>
+  Pro tip: include the <code>aggregate_id</code> and <code>aggregate_version</code> in each event. Consumers that maintain their own read models can use <code>(aggregate_id, version)</code> as a dedup key, which survives message replays and schema migrations on the outbox table itself.
+</blockquote>
+
+<h2>Observability: What You Need in Production</h2>
+
+<p>An outbox relay in production without observability is a black box. You need at minimum:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Metric</th>
+      <th>What it tells you</th>
+      <th>Alert at</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>outbox.published</code> (counter)</td>
+      <td>Throughput — events leaving the service</td>
+      <td>Zero for >5 min</td>
+    </tr>
+    <tr>
+      <td><code>outbox.retry</code> (counter)</td>
+      <td>Transient failures — Pub/Sub publish errors</td>
+      <td>>1% of total</td>
+    </tr>
+    <tr>
+      <td><code>outbox.lag</code> (gauge)</td>
+      <td>Unpublished row count — how far behind the relay is</td>
+      <td>>1000 for >2 min</td>
+    </tr>
+    <tr>
+      <td><code>outbox.age_oldest</code> (gauge)</td>
+      <td>Seconds since the oldest unpublished row was created</td>
+      <td>>300 (5 min)</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>Log the trace_id on every publish and every failure. When an incident occurs, you search by trace_id across services and instantly see where the event stopped flowing:</p>
+
+<pre><code>2026-04-15 14:32:01 INFO  [trace=abc123] OutboxRelay - Published event 550e8400-e29b-41d4-a716-446655440000
+2026-04-15 14:32:01 INFO  [trace=abc123] OutboxRelay - Published event 550e8400-e29b-41d4-a716-446655440001
+2026-04-15 14:32:02 WARN  [trace=abc123] OutboxRelay - Retry event 550e8400-e29b-41d4-a716-446655440002: DEADLINE_EXCEEDED</code></pre>
+
+<h2>What About Ordering?</h2>
+
+<p>Pub/Sub does <strong>not</strong> guarantee order across messages unless you use <strong>ordering keys</strong>. If your downstream consumers need strict ordering per aggregate (e.g., "CustomerUpdated must arrive before CustomerDeactivated"), set the <code>ordering_key</code> on each message to the <code>aggregate_id</code>:</p>
+
+<pre><code>PubsubMessage message = PubsubMessage.newBuilder()
+    .setData(ByteString.copyFromUtf8(event.payload()))
+    .putAttributes("trace_id", traceId)
+    .setOrderingKey(event.aggregateId())
+    .build();</code></pre>
+
+<p>On the subscription side, enable <code>enable_message_ordering</code>. Ordered delivery comes with throughput trade-offs — about 1 MB/s per ordering key — which is fine for per-aggregate ordering where each aggregate produces events at human-scale rates.</p>
+
+<h2>When the Outbox Table Grows</h2>
+
+<p>Published rows accumulate. A weekly cleanup job keeps the table lean:</p>
+
+<pre><code>-- Run as a scheduled task every Sunday at 3 AM
+DELETE FROM outbox_events
+WHERE published_at IS NOT NULL
+  AND published_at &lt; now() - INTERVAL '7 days';</code></pre>
+
+<p>On Postgres, <code>DELETE</code> of large row sets produces bloat. If you delete more than ~100k rows per week, use <code>pg_repack</code> or partition the table by <code>created_at</code> monthly and drop old partitions.</p>
+
+<h2>Alternatives and When to Avoid the Outbox</h2>
+
+<p>The transactional outbox is not the only game in town. Briefly:</p>
+
+<ul>
+  <li><strong>Change Data Capture (CDC) with Debezium</strong> — streams your database WAL directly to Pub/Sub via the Kafka Connect Pub/Sub Sink. No outbox table needed. The trade-off is operational complexity: you now manage a Debezium connector, a Kafka cluster (or a standalone Connect worker), and the WAL-level permissions. Great for existing databases where you cannot add an outbox table. Overkill if you are building a new service.</li>
+  <li><strong>Two-phase commit (XA)</strong> — coordinates the database and Pub/Sub in a single distributed transaction. Works in theory; in practice, XA transactions lock database resources for the duration of a network call, which breaks under load. Avoid.</li>
+  <li><strong>Event sourcing</strong> — the domain events <em>are</em> the database. Your outbox is your primary store. This is architecturally clean but a significant departure from the relational model most teams use.</li>
+</ul>
+
+<p>For most Spring Boot services on GCP that need reliable message delivery, the transactional outbox with a Postgres-backed relay strikes the right balance: zero infrastructure beyond what you already have, clear semantics, and straightforward debugging when something goes wrong.</p>
+
+<hr/>
+
+<p class="footnote">
+  <em>Orlando Burli Junior is a Senior Software Engineer at Rocket Lawyer, where he works on customer intelligence platforms, event-driven architectures, and cloud-native systems on GCP. The outbox pattern described here was implemented as part of a larger event-ingestion pipeline processing millions of business events per day.</em>
+</p>
 
 </body>
 </html>

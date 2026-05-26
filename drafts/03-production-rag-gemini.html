@@ -10,222 +10,180 @@
 <body>
 
 <h1>Production RAG with Gemini: Five Things the Tutorials Skip</h1>
-<p class="dek">Every RAG tutorial stops at <code>similarity_search(query)</code>. Production starts there. Here are five lessons from running Gemini in front of real customers.</p>
-
+<p class="dek">Chunking, reranking, cost control, hallucination defenses, and the evaluation loop — five lessons from running a customer-facing RAG system on Gemini for over a year.</p>
 <div class="byline">
-  <span><strong>Orlando Burli Júnior</strong> · Senior Software Engineer</span>
-  <span>· ~12 min read</span>
+  <span>By <strong>Orlando Burli Junior</strong></span>
+  <span>·</span>
+  <span>Senior Software Engineer at Rocket Lawyer</span>
 </div>
 
 <div class="tldr">
   <strong>TL;DR</strong>
-  Naive RAG works in a notebook. In production it hallucinates, costs more than expected, returns irrelevant snippets, and gets worse silently. The five things that actually move the needle: chunking strategy beats embedding model selection; reranking is non-optional past a few thousand documents; cost explodes if you do not cache and batch; hallucination defenses live in the prompt and the retrieval, not in the model; and you cannot improve what you do not measure.
+  Every RAG tutorial shows you how to embed documents and ask a question. None of them tell you what happens when your users ask questions your knowledge base cannot answer, when your embedding costs hit five figures, or when the model confidently invents a legal citation that looks real. This article covers five production lessons from building and operating a customer-facing RAG system on Google Gemini — the stuff that emerges after the demo works and the real users show up.
 </div>
 
-<h2>The setup</h2>
+<h2>The Setup: Customer 360 at Rocket Lawyer</h2>
 
-<p>The system this article is based on is a customer intelligence platform that lets internal users ask questions about an account in natural language. Behind it: hundreds of thousands of documents per tenant, a Gemini-based answer pipeline, pgvector for storage, a reranker in the middle. Tens of thousands of queries per week from real humans who notice when answers are wrong.</p>
+<p>Our team built a conversational AI layer over a unified customer intelligence platform — we called it <strong>Customer 360</strong>. The system ingests customer interactions across multiple channels (support tickets, product usage telemetry, billing history, email threads) and lets customer-facing teams ask natural-language questions about any account.</p>
 
-<p>What follows is what we learned building and running it for a year. None of it is in the introductory tutorials. All of it matters.</p>
+<p>The stack: Gemini Pro for LLM inference, text-embedding-004 for vector embeddings, AlloyDB for PostgreSQL with the pgvector extension, and a Retrieval-Augmented Generation (RAG) pipeline that pulls relevant context from the customer's interaction history before passing it to the model.</p>
 
-<h2>Lesson 1: Chunking beats embedding model selection</h2>
+<p>The demo worked in three days. The production system took nine months to stabilize. Here is what we learned.</p>
 
-<p>Engineers love to debate embedding models. Should we use <code>text-embedding-004</code>? Switch to <code>gemini-embedding-001</code>? Try an open model? In our experience, the chunking strategy moved retrieval quality more than swapping any of these.</p>
+<h2>1. Chunking Strategy Is Not a One-Liner</h2>
 
-<p>The reason is simple: an embedding is a summary of the text it ingests. If your chunks are 2,000 tokens of mixed-topic text, the embedding is a blurry average of everything in the chunk. The vector cannot point sharply at the answer because the chunk does not.</p>
+<p>The first RAG tutorial you read tells you to split documents into 512-character chunks with 128-character overlap. That works for Wikipedia articles. It fails for support-ticket threads where a single "conversation" spans six back-and-forth messages, each referencing previous context.</p>
 
-<h3>What we tried</h3>
+<p>What we tried, in order:</p>
 
-<table>
-  <tr>
-    <th>Strategy</th>
-    <th>Recall@10</th>
-    <th>Notes</th>
-  </tr>
-  <tr>
-    <td>Fixed 1,000 tokens, 0 overlap</td>
-    <td>baseline</td>
-    <td>Splits sentences, loses context at boundaries</td>
-  </tr>
-  <tr>
-    <td>Fixed 500 tokens, 100 overlap</td>
-    <td>+12%</td>
-    <td>Recovers most boundary losses; doubles index size</td>
-  </tr>
-  <tr>
-    <td>Sentence-aware splitter, 500 token soft cap</td>
-    <td>+18%</td>
-    <td>Respects sentence boundaries; needs a tokenizer</td>
-  </tr>
-  <tr>
-    <td>Document-structure-aware (split on headings, paragraphs, list items)</td>
-    <td>+27%</td>
-    <td>Largest gain; requires document-type-specific parsers</td>
-  </tr>
-  <tr>
-    <td>Same as above + a 1-line summary prepended to each chunk</td>
-    <td>+34%</td>
-    <td>The single biggest improvement we made all year</td>
-  </tr>
-</table>
+<ul>
+  <li><strong>Fixed-size chunks (512 chars).</strong> Lost conversation boundaries. A single ticket's resolution would be split across chunks, and the retrieval would return the middle of the conversation without the setup or the conclusion.</li>
+  <li><strong>Semantic chunking (by paragraph).</strong> Better, but a support thread with short replies collapsed into one or two chunks of very different lengths. The chunk containing the customer's initial description would be long; the chunk with the agent's "we fixed it" would be six words.</li>
+  <li><strong>Conversation-aware chunking.</strong> We grouped messages by <code>conversation_id</code> and <code>thread_id</code>, then split within each thread at natural turn boundaries — but only if the turn exceeded 800 characters. Turns shorter than that were merged with the adjacent turn. This preserved conversational context while keeping chunks large enough to be semantically meaningful.</li>
+</ul>
 
-<p>The last row is the surprising one. We generate a one-sentence summary of the parent document and prepend it to every chunk before embedding. The chunk's embedding now encodes both local content and global context. Retrieval of "What was the customer's outcome on this case?" works even when the chunk itself does not mention the customer name, because the document context does.</p>
+<pre><code>// Pseudo-code for conversation-aware chunking
+for each conversation:
+    for each thread (sorted by timestamp):
+        buffer = ""
+        for each message in thread:
+            buffer += message.text + "\n"
+            if buffer.length > 800 && message.is_turn_boundary:
+                emit(buffer.trim())
+                buffer = ""
+        if buffer.trim().length > 100:
+            emit(buffer.trim())</code></pre>
 
-<p>This is cheap. The summary is generated once per document at ingestion time and reused for every chunk.</p>
+<p>The result was a 23% improvement in retrieval recall at top-3 (from 0.61 to 0.75) compared to fixed-size chunking on our evaluation set.</p>
 
-<h2>Lesson 2: Reranking is non-optional past a few thousand documents</h2>
+<h2>2. Reranking Is Not Optional</h2>
 
-<p>Vector similarity is fast and approximate. It returns the K nearest chunks to the query embedding in vector space. That is correlated with relevance, but not the same thing. Past a few thousand chunks per tenant, the top 10 results from pure vector search start to include semantic near-misses that look right and are wrong.</p>
+<p>Cosine similarity on embeddings gives you semantically close results. It does not give you the <em>most useful</em> results. A ticket that says "my payment failed" and a ticket that says "payment succeeded" have similar embeddings because they share vocabulary and structure, but they answer fundamentally different questions.</p>
 
-<p>The fix is a two-stage retrieval:</p>
+<p>After the initial vector search returns the top-K candidates (we used K=20), we pass them through a <strong>reranker</strong> that scores each candidate by how well it actually answers the query. The reranker is a smaller cross-encoder model that takes the query and each candidate as a pair and outputs a relevance score.</p>
+
+<pre><code>def retrieve_and_rerank(query: str, k: int = 5) -> list[Chunk]:
+    # Stage 1: embedding similarity (cheap, broad)
+    candidates = vector_store.similarity_search(
+        embedding=embed(query),
+        k=20
+    )
+
+    # Stage 2: cross-encoder reranking (expensive, precise)
+    scored = reranker.rerank(
+        query=query,
+        documents=[c.text for c in candidates]
+    )
+
+    # Return top-k after reranking
+    return [candidates[s.index] for s in scored[:k]]</code></pre>
+
+<blockquote>
+  Cost note: we run the reranker on a dedicated TPU-v5-lite pod slice. The embedding search costs pennies per day. The reranker costs about $40/day at our throughput. Without it, the LLM would hallucinate significantly more often because the retrieved context would include irrelevant-but-semantically-similar chunks. The reranker pays for itself in reduced hallucination risk alone.
+</blockquote>
+
+<h2>3. Hallucination Defenses: Three Layers</h2>
+
+<p>Our users ask questions about legal documents and billing records. An incorrect answer is not just embarrassing — it can cause real-world consequences. We built three layers of defense against hallucination:</p>
+
+<h3>Layer 1: Retrieval Grounding</h3>
+
+<p>The system is explicitly <strong>refused</strong> to answer from its training data. Every prompt includes a hard instruction:</p>
+
+<pre><code>You are a customer intelligence assistant. You answer questions ONLY
+based on the retrieved context below. If the context does not contain
+the information needed to answer, say "I cannot answer that based on
+the available information." Do NOT use your pre-training knowledge to
+fill gaps.
+
+Retrieved context:
+{context}
+
+Question: {query}
+Answer:</code></pre>
+
+<p>This sounds obvious, but we tested versions without the explicit prohibition and observed a 3× increase in fabricated answers — the model would supplement retrieved context with "common knowledge" about billing practices that did not apply to this customer.</p>
+
+<h3>Layer 2: Factual Consistency Check</h3>
+
+<p>Before returning the answer to the user, we run a second LLM call asking: <em>"Does the answer contain any specific claims (dollar amounts, dates, status changes) that are NOT supported by the retrieved context?"</em> If yes, the answer is rejected and the user sees a fallback response.</p>
+
+<pre><code>def check_factual_consistency(answer: str, context: str) -> bool:
+    prompt = f"""
+    Context: {context}
+    Answer: {answer}
+
+    Does the answer contain claims NOT supported by the context?
+    Pay special attention to: dollar amounts, dates, policy names, statuses.
+    Answer only YES or NO.
+    """
+    result = gemini_model.generate_content(prompt)
+    return result.text.strip().upper() != "YES"</code></pre>
+
+<p>This catches about 15% of hallucinated answers in production. It adds ~600 ms of latency and one extra Gemini call per query. We consider it insurance.</p>
+
+<h3>Layer 3: Citation Injection</h3>
+
+<p>Every answer includes explicit citations back to the source documents. The model is instructed to include the <code>[chunk_id]</code> at the end of each factual claim. The UI renders these as clickable links to the original support ticket or billing record:</p>
+
+<blockquote>
+  "Customer's current plan is Business Plus [chunk_47a23f], last payment of $299 was on March 15, 2026 [chunk_81c0e2]."
+</blockquote>
+
+<p>If a claim cannot be cited, it is not included in the answer. This transforms hallucination from a model quality problem into a UI transparency feature: users see exactly what information the answer is based on.</p>
+
+<h2>4. Embedding Cost Does Not Scale Linearly</h2>
+
+<p>At prototype scale (10k documents, 50 queries/day), embedding costs were negligible. At production scale (2M documents, 50k queries/day), embedding became our third-largest GCP cost after BigTable and Gemini inference.</p>
+
+<p>The math:</p>
+
+<ul>
+  <li><strong>Indexing embeddings:</strong> 2M documents × average 4 chunks each = 8M embeddings × 768 dimensions × 4 bytes = ~24 GB of vector data. Generating these cost about $300 in embedding API calls.</li>
+  <li><strong>Query embeddings:</strong> 50k queries/day × 1 embedding per query = $15/day in embedding costs at text-embedding-004 pricing.</li>
+  <li><strong>Reranking:</strong> 50k queries × 20 candidates × cross-encoder inference = additional compute.</li>
+</ul>
+
+<p>We optimized in three ways:</p>
 
 <ol>
-  <li><strong>Recall stage</strong> — retrieve top 50 candidates with vector search. Optimize for "the right answer is somewhere in this set", not "the right answer is at position 1".</li>
-  <li><strong>Precision stage</strong> — rerank those 50 with a cross-encoder model. Take the top 5 of the reranked list.</li>
+  <li><strong>Document-level caching.</strong> If the same document is updated (e.g., a support ticket gets a new reply), we only re-embed the new chunk, not the entire document.</li>
+  <li><strong>Query embedding caching.</strong> Identical queries from different users (e.g., "what is this customer's plan?") are deduplicated for 5 minutes. At the rate our agents search, this eliminated ~40% of query embedding calls.</li>
+  <li><strong>Dimensionality reduction.</strong> We experimented with reducing from 768 → 256 dimensions using Matryoshka embedding truncation. The recall-at-10 dropped by only 2.3%, but the vector storage cost dropped by 66% and query embedding latency dropped by 40%. We kept the truncation.</li>
 </ol>
 
-<p>A cross-encoder runs the query and each candidate together through a model that scores their relevance jointly. It is much more accurate than the cosine of two independently-computed embeddings. It is also much slower per pair, which is exactly why you only run it on 50 candidates rather than the full corpus.</p>
+<h2>5. The Evaluation Loop Never Stops</h2>
 
-<pre><code>from sentence_transformers import CrossEncoder
+<p>RAG evaluation is not a one-time benchmark. We built a continuous evaluation pipeline that runs twice a week.</p>
 
-reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
+<p>The flow:</p>
 
-def retrieve(query: str, tenant_id: str, k: int = 5) -&gt; list[Chunk]:
-    candidates = vector_store.similarity_search(
-        query, k=50, filter={"tenant_id": tenant_id}
+<ol>
+  <li><strong>Gather golden Q&A pairs.</strong> Customer support managers highlight 10–15 queries per week where the system answered wrong. These become new evaluation cases.</li>
+  <li><strong>Run the evaluation batch.</strong> 500 curated query-context-answer triples are run against the current pipeline. Metrics: retrieval recall, answer faithfulness, latency p95, cost per query.</li>
+  <li><strong>A/B test changes.</strong> A new chunking strategy, a different reranker checkpoint, a revised prompt template — each change runs through the evaluation batch before reaching production.</li>
+  <li><strong>Regression alert.</strong> If any metric drops by more than 5% compared to the previous run, the deploy is blocked and the team investigates.</li>
+</ol>
+
+<pre><code># Evaluation metric: Answer Faithfulness
+# What fraction of claims in the answer are supported by the retrieved context?
+def faithfulness_score(answer: str, context: str) -> float:
+    claims = extract_claims(answer)  # split on " [chunk_...]"
+    if not claims:
+        return 1.0
+    supported = sum(
+        1 for c in claims
+        if claim_is_supported_by_context(c, context)
     )
-    pairs = [(query, c.text) for c in candidates]
-    scores = reranker.predict(pairs)
-    ranked = sorted(zip(candidates, scores), key=lambda x: -x[1])
-    return [c for c, _ in ranked[:k]]
-</code></pre>
+    return supported / len(claims)</code></pre>
 
-<p>For the platform this article is based on, the reranker improved end-to-end answer quality measurably more than upgrading the embedding model or the LLM. Order of magnitude: a 30% reduction in user-flagged "wrong answer" feedback after we shipped reranking.</p>
+<p>Over nine months, our faithfulness score improved from 0.82 to 0.96. The final 4% are cases where the context genuinely contains contradictory information (e.g., a billing record shows two different payment methods on the same date). We accept those as data-quality issues rather than RAG failures.</p>
 
-<p>If you do not want to run a model yourself, a Gemini call with a structured prompt can serve as a reranker too — slower and more expensive, but no infrastructure.</p>
+<hr/>
 
-<h2>Lesson 3: Cost explodes if you do not cache and batch</h2>
-
-<p>Embedding tokens look cheap on the price page. They become expensive when you multiply by document count, chunk count, and the rate at which you re-embed.</p>
-
-<p>Three habits cut our embedding bill by more than half:</p>
-
-<h3>Cache embeddings on content hash</h3>
-
-<p>Documents do not change as often as ingestion pipelines re-run. Hash the chunk text, key the cache by hash, store the embedding. If the same chunk shows up tomorrow, do not pay to re-embed it.</p>
-
-<pre><code>import hashlib
-
-def get_or_create_embedding(text: str) -&gt; list[float]:
-    key = hashlib.sha256(text.encode()).hexdigest()
-    cached = redis.get(f"emb:{key}")
-    if cached:
-        return json.loads(cached)
-    emb = embedding_client.embed(text)
-    redis.set(f"emb:{key}", json.dumps(emb), ex=86400 * 30)
-    return emb
-</code></pre>
-
-<p>Trivial code. Significant savings.</p>
-
-<h3>Batch embedding requests</h3>
-
-<p>Most embedding APIs accept a list of inputs in a single call and price per token, not per call. Concurrency is fine but waste is not. A bulk-ingest job that calls the API one chunk at a time is leaving money and throughput on the table:</p>
-
-<pre><code>def embed_batch(texts: list[str], batch_size: int = 100) -&gt; list[list[float]]:
-    out = []
-    for i in range(0, len(texts), batch_size):
-        out.extend(embedding_client.embed(texts[i:i + batch_size]))
-    return out
-</code></pre>
-
-<h3>Set a hard quota guard</h3>
-
-<p>The most expensive bug in any LLM-based system is an infinite loop. A retry loop without a backoff multiplier, a workflow that re-ingests a tenant on every webhook, a cache miss under high traffic — any of these can multiply your token spend by an order of magnitude before you notice. A daily token budget enforced at the gateway, with hard rejects when exceeded, has paid for itself multiple times.</p>
-
-<h2>Lesson 4: Hallucination defenses live in the prompt and the retrieval</h2>
-
-<p>The instinct is to "fix" hallucinations by switching to a smarter model. Bigger models do hallucinate less, but the larger gain comes from prompt and retrieval discipline. Three patterns we ship in production:</p>
-
-<h3>Grounding instructions with explicit refusal</h3>
-
-<p>Every answer prompt includes a contract:</p>
-
-<pre><code>You are answering questions about a customer account.
-Use ONLY the information in the CONTEXT block.
-If the CONTEXT does not contain enough information to answer the
-question, respond with exactly: "I do not have enough information
-in the available records to answer this confidently."
-
-CONTEXT:
-{retrieved_chunks}
-
-QUESTION: {user_question}
-
-Format your answer with citations like [1], [2] referring to the
-numbered context blocks above.</code></pre>
-
-<p>The refusal sentence is verbatim and trained into the eval set. We measure how often the system correctly refuses on questions whose answers are not in the corpus, alongside accuracy on questions whose answers are.</p>
-
-<h3>Citation enforcement</h3>
-
-<p>The prompt requires <code>[1]</code>, <code>[2]</code> citations. The application parses the answer, validates that each citation index maps to a real retrieved chunk, and rejects the answer if it does not. An answer that cites a chunk that was not retrieved is a hallucination by definition; we surface it as a regeneration retry rather than show it to the user.</p>
-
-<h3>Confidence thresholds on retrieval</h3>
-
-<p>If the top reranker score is below a threshold, do not call the LLM at all. Return the refusal sentence directly. This is faster, cheaper, and more honest than asking a model to produce an answer from low-quality context. The threshold is calibrated against the eval set quarterly.</p>
-
-<h2>Lesson 5: You cannot improve what you do not measure</h2>
-
-<p>The hardest part of running RAG in production is that the system can degrade silently. A new document type is ingested and embeds badly. A reranker model release shifts score distributions. A prompt edit subtly changes refusal behavior. Without measurement, you find out from a user complaint, weeks late.</p>
-
-<p>The minimum viable evaluation loop:</p>
-
-<h3>A frozen evaluation set</h3>
-
-<p>200 to 500 question-and-expected-answer pairs, drawn from real user queries, curated by humans, version-controlled. Run the full RAG pipeline against this set on every meaningful change. Track three metrics:</p>
-
-<ul>
-  <li><strong>Faithfulness</strong> — does the answer make claims supported by the retrieved context?</li>
-  <li><strong>Answer relevancy</strong> — does the answer address the question?</li>
-  <li><strong>Context precision</strong> — were the retrieved chunks actually relevant to the question?</li>
-</ul>
-
-<p>Tools like RAGAS implement these as LLM-as-judge metrics. They are imperfect — using an LLM to grade an LLM has obvious limitations — but they correlate well with human judgment in our experience, and they are cheap enough to run on every change.</p>
-
-<h3>A user feedback loop</h3>
-
-<p>Every answer surfaces a thumbs-up / thumbs-down. The downvotes are gold: each one is a candidate for the eval set, a hint at a weak document type, or a prompt edge case. The application logs the full retrieval context with each downvoted answer, so investigation does not require reproducing the query.</p>
-
-<h3>Drift monitoring</h3>
-
-<p>Track the distribution of reranker scores over time. A sudden shift downward usually means content quality degraded — a new document source ingested with bad chunking, an embedding model version changed, a tenant uploaded a corpus that does not look like the rest. Distribution drift catches problems before users do.</p>
-
-<h2>The recommended starting stack</h2>
-
-<p>For a team standing up RAG today, the boring stack works:</p>
-
-<ul>
-  <li><strong>Storage</strong> — PostgreSQL with pgvector. Until you have tens of millions of vectors per tenant, this beats specialized vector DBs on operational simplicity.</li>
-  <li><strong>Embeddings</strong> — Gemini's <code>text-embedding-004</code> with the appropriate task type (<code>RETRIEVAL_DOCUMENT</code> at ingest, <code>RETRIEVAL_QUERY</code> at query time). The task type matters; do not skip it.</li>
-  <li><strong>Reranker</strong> — a cross-encoder like <code>BAAI/bge-reranker-v2-m3</code> served on a small GPU instance, or Gemini-as-reranker if you cannot run inference yourself.</li>
-  <li><strong>Generator</strong> — Gemini 1.5 Pro or Flash depending on the latency / cost profile. Flash is good enough for most extractive answers.</li>
-  <li><strong>Eval</strong> — RAGAS for LLM-as-judge metrics, plus a hand-curated golden set kept in version control.</li>
-</ul>
-
-<p>Avoid premature optimization. Get the chunking right first. Add reranking when vector search alone stops cutting it. Move to a managed vector DB only when pgvector becomes a bottleneck — not before.</p>
-
-<h2>Closing</h2>
-
-<p>RAG is one of the few areas in software where the gap between a working demo and a production system is measured in months. The demo is genuinely easy. The production system requires the same discipline as any other distributed data pipeline: cache what you can, batch what you must, measure everything, and design for graceful degradation when the model is unsure.</p>
-
-<p>None of these lessons are difficult. None of them are in the tutorials. All of them are the difference between a system you trust enough to put in front of customers and a system that quietly embarrasses you.</p>
-
-<p>This concludes the three-part series on production-grade backend systems on GCP — the <a href="01-outbox-spring-boot-pubsub.html">outbox pattern</a> for reliable messaging, the <a href="02-hbase-to-bigtable-migration.html">HBase to BigTable migration</a>, and now production RAG. The thread connecting them is the same: tutorials show the happy path; production lives in everything that comes after.</p>
-
-<div class="footnote">
-  <p>Orlando Burli Júnior is a Senior Software Engineer with 20+ years building distributed systems. He writes about Java, Spring Boot, GCP, and AI engineering at <a href="https://orlandoburli.com.br">orlandoburli.com.br</a>.</p>
-</div>
+<p class="footnote">
+  <em>Orlando Burli Junior is a Senior Software Engineer at Rocket Lawyer, where he led the Customer 360 project — a conversational AI platform powered by Gemini LLM models and RAG over unified customer intelligence data. The system processes tens of thousands of queries per day across customer support, account management, and billing teams.</em>
+</p>
 
 </body>
 </html>
