@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Spring Boot on GCP: The Production Checklist Nobody Publishes</title>
+  <meta name="description" content="A practical pre-flight checklist for Spring Boot services running on Google Cloud — startup, observability, secrets, networking, autoscaling, and the things that look fine in staging and break in production."/>
+  <meta name="robots" content="noindex, nofollow"/>
+  <link rel="stylesheet" href="article.css"/>
+</head>
+<body>
+
+<h1>Spring Boot on GCP: The Production Checklist Nobody Publishes</h1>
+<p class="dek">Twenty things to verify before your Spring Boot service hits real traffic on Google Cloud. None of them are interesting individually. All of them have caused outages somewhere.</p>
+
+<div class="byline">
+  <span><strong>Orlando Burli Júnior</strong> · Senior Software Engineer</span>
+  <span>· ~11 min read</span>
+</div>
+
+<div class="tldr">
+  <strong>TL;DR</strong>
+  Spring Boot on GCP works out of the box for the demo. The gap between the demo and production is filled with small decisions that look fine in staging and become outages with real traffic. This is the checklist I run through before every new service goes live — startup behavior, observability, secrets, networking, autoscaling, and the operational details that nobody writes down.
+</div>
+
+<h2>How to use this checklist</h2>
+
+<p>The list is grouped by category. Each item is short on purpose — if a section needs a deeper explanation, it gets a paragraph; if it does not, it gets a bullet. None of these are theoretical. Every one represents a real incident I have either lived through or watched a team live through.</p>
+
+<p>Treat it as a pre-flight checklist, not a tutorial. Walk through it once before you go live, then again every six months as the service evolves.</p>
+
+<h2>Startup and shutdown</h2>
+
+<h3>1. Health check endpoints, separated by purpose</h3>
+
+<p>Spring Boot Actuator gives you <code>/actuator/health</code>. The default lumps liveness and readiness together, which is wrong. Configure them separately:</p>
+
+<pre><code>management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState, db, pubsub</code></pre>
+
+<p>Liveness is "the JVM is responsive". Readiness is "I can serve traffic". Mixing them causes Kubernetes to restart pods that are temporarily unable to reach a dependency, which makes the dependency outage worse.</p>
+
+<h3>2. Graceful shutdown</h3>
+
+<pre><code>server:
+  shutdown: graceful
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s</code></pre>
+
+<p>On a SIGTERM (which GKE sends before killing a pod), in-flight requests get up to 30 seconds to complete. Without this, every deployment drops a percentage of requests equal to your concurrency. Customers notice.</p>
+
+<h3>3. Pre-stop hook on the pod</h3>
+
+<p>Even with graceful shutdown, the pod is removed from the service immediately on termination. Add a small pre-stop sleep so the load balancer has time to stop sending new traffic before SIGTERM fires:</p>
+
+<pre><code>lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sh", "-c", "sleep 5"]</code></pre>
+
+<h3>4. Startup probe with realistic budget</h3>
+
+<p>JVM applications are slow to start. A liveness probe with a 30-second initial delay will kill a pod that needed 35 seconds to warm the JIT. Use a startup probe instead — it gives the JVM a generous warmup window before liveness takes over:</p>
+
+<pre><code>startupProbe:
+  httpGet: {path: /actuator/health/liveness, port: 8080}
+  failureThreshold: 30
+  periodSeconds: 5</code></pre>
+
+<h2>Observability</h2>
+
+<h3>5. Structured logging in JSON</h3>
+
+<p>Cloud Logging extracts structured fields automatically when log lines are JSON. Use Logback's encoder or the <code>logstash-logback-encoder</code> dependency:</p>
+
+<pre><code>&lt;appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender"&gt;
+  &lt;encoder class="net.logstash.logback.encoder.LogstashEncoder"&gt;
+    &lt;customFields&gt;{"service":"orders-api"}&lt;/customFields&gt;
+  &lt;/encoder&gt;
+&lt;/appender&gt;</code></pre>
+
+<p>Now <code>jsonPayload.severity</code>, <code>jsonPayload.thread_name</code>, <code>jsonPayload.logger_name</code>, and any MDC values are queryable in Cloud Logging directly. Without this, you are grep-ing free text.</p>
+
+<h3>6. Trace context propagation</h3>
+
+<p>Add <code>spring-cloud-gcp-starter-trace</code> and your service emits OpenTelemetry traces to Cloud Trace automatically. Crucially, the W3C trace context header propagates through outbound RestClient / WebClient calls, which means a request that touches three services produces one trace, not three.</p>
+
+<h3>7. The four metrics that matter</h3>
+
+<p>Wire Micrometer to Cloud Monitoring and create dashboards for the four golden signals:</p>
+
+<ul>
+  <li><strong>Latency</strong> — p50, p95, p99 of HTTP server requests, broken down by route.</li>
+  <li><strong>Traffic</strong> — requests per second, broken down by route and status code.</li>
+  <li><strong>Errors</strong> — 5xx rate, broken down by route.</li>
+  <li><strong>Saturation</strong> — JVM heap usage, thread pool utilization, connection pool utilization.</li>
+</ul>
+
+<p>If you only ever look at four dashboards, those are the ones.</p>
+
+<h3>8. Alert on rate of change, not absolute values</h3>
+
+<p>An alert that fires at "5xx rate &gt; 1%" misses gradual degradation and false-positives during normal traffic spikes. Alert on "5xx rate has doubled in the last 5 minutes". You catch the regression sooner and false-positive less.</p>
+
+<h2>Secrets and configuration</h2>
+
+<h3>9. Secret Manager, not env vars in YAML</h3>
+
+<p>Use the GCP Secret Manager Spring starter:</p>
+
+<pre><code>spring:
+  cloud:
+    gcp:
+      secretmanager:
+        enabled: true
+
+datasource:
+  password: ${sm://projects/my-project/secrets/db-password/versions/latest}</code></pre>
+
+<p>Secrets are fetched at startup and cached. Rotation is a Secret Manager version bump plus a pod restart — no code change, no redeploy of new env-var bundles.</p>
+
+<h3>10. Workload Identity for service auth</h3>
+
+<p>Stop downloading service account JSON keys. Bind the Kubernetes service account to a Google service account via Workload Identity. The pod's GCP API calls authenticate without a key file ever existing on disk.</p>
+
+<pre><code>apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: orders-api
+  annotations:
+    iam.gke.io/gcp-service-account: orders-api@my-project.iam.gserviceaccount.com</code></pre>
+
+<h3>11. Profile-based config with explicit prod profile</h3>
+
+<p>Always run with <code>SPRING_PROFILES_ACTIVE=prod</code> in production. Make the prod profile explicit. Rely on neither defaults nor environment-variable inheritance — both have surprising behavior when something forgets to set them.</p>
+
+<h2>Networking</h2>
+
+<h3>12. Connection pool sizing for backends</h3>
+
+<p>The default HikariCP pool is 10 connections. For most services this is fine. For services that fan out to several backends, that pool is shared across all your blocking I/O — including the JDBC connection pool and any internal RestClient pools. Right-size them for your concurrency. A useful starting point:</p>
+
+<pre><code>spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 5000
+      idle-timeout: 600000
+      max-lifetime: 1800000</code></pre>
+
+<p>The <code>max-lifetime</code> matters for Cloud SQL — proxy connections get reaped server-side after a period of inactivity, and a stale connection in the pool causes the next request to fail with a confusing error.</p>
+
+<h3>13. HTTP client timeouts everywhere</h3>
+
+<p>The default HTTP client (<code>HttpClient</code>) has no read timeout. A backend that hangs will hang your service indefinitely. Configure timeouts globally:</p>
+
+<pre><code>@Bean
+public RestClient restClient() {
+    HttpClient client = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(2))
+        .build();
+    return RestClient.builder()
+        .requestFactory(new JdkClientHttpRequestFactory(client))
+        .defaultStatusHandler(HttpStatusCode::isError, (req, res) -&gt; { /* logging */ })
+        .build();
+}</code></pre>
+
+<p>Pair with a per-call read timeout. No client should ever wait forever.</p>
+
+<h3>14. Circuit breakers on critical paths</h3>
+
+<p>Resilience4j integrates cleanly with Spring Boot. For any backend that is not your own database, wrap calls in a circuit breaker. The default of 50% failure rate over a 100-call window is a reasonable starting point. Tune based on real traffic.</p>
+
+<h2>Data</h2>
+
+<h3>15. Cloud SQL via the connector, not via IP</h3>
+
+<p>The Cloud SQL Java connector authenticates via IAM, encrypts in transit, and survives Cloud SQL maintenance windows that would tear down a raw TCP connection. Use it.</p>
+
+<pre><code>spring:
+  datasource:
+    url: jdbc:postgresql:///mydb?cloudSqlInstance=project:region:instance&amp;socketFactory=com.google.cloud.sql.postgres.SocketFactory&amp;user=svc@my-project.iam&amp;password=ignored</code></pre>
+
+<p>Bonus: combine with Workload Identity and you have passwordless DB auth.</p>
+
+<h3>16. Read-only replicas for read-heavy workloads</h3>
+
+<p>If your service is read-heavy and your queries can tolerate replica lag of a few hundred milliseconds, route reads to a replica. Spring's <code>AbstractRoutingDataSource</code> does this in 30 lines and removes substantial load from the primary.</p>
+
+<h3>17. Migrations run as a separate job, not at startup</h3>
+
+<p>Flyway is great. Running migrations during application startup with multiple replicas is not. The first replica races to acquire the migration lock; the others time out and crash. Run migrations as a Kubernetes <code>Job</code> before rolling out the new version of the deployment. The application's Flyway client only verifies the current version on startup.</p>
+
+<h2>Autoscaling</h2>
+
+<h3>18. CPU-based HPA is a starting point, not a finish line</h3>
+
+<p>Default to CPU-based autoscaling. For services where the bottleneck is not CPU (request queue depth on an I/O-bound service, for example), add custom metrics. Cloud Monitoring + the GKE custom metrics adapter let you scale on Pub/Sub queue depth, request rate, or anything else Micrometer exposes.</p>
+
+<h3>19. PodDisruptionBudget so the cluster cannot evict you to nothing</h3>
+
+<pre><code>apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: orders-api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: orders-api</code></pre>
+
+<p>Without a PDB, a node drain (auto-upgrades, autoscaling rebalance) can take all your replicas down at once. With a PDB, the cluster waits for replacements before taking the next pod. This is the cheapest availability improvement on the list.</p>
+
+<h2>Deployment</h2>
+
+<h3>20. Canary deploys with traffic split</h3>
+
+<p>The boring version of this: deploy version N+1 alongside N, route 5% of traffic to N+1, watch error rates and latency for 10 minutes, then promote. The infrastructure for this exists on GKE without any service mesh — annotated services and Backend Service traffic splits do the job. The cultural infrastructure is harder; teams resist canary because it slows down deploys. The math says canary saves more time than it costs as soon as it catches one bad deploy per quarter.</p>
+
+<h2>The non-negotiables</h2>
+
+<p>If you do nothing else from this list, do these five:</p>
+
+<ol>
+  <li>Separate liveness and readiness probes.</li>
+  <li>Graceful shutdown with the matching pre-stop hook.</li>
+  <li>Structured JSON logging.</li>
+  <li>HTTP client timeouts on every outbound call.</li>
+  <li>PodDisruptionBudget on every Deployment.</li>
+</ol>
+
+<p>None of them are sexy. None of them get you a promotion. All of them make the difference between a service that runs in production and a service that runs in production <em>well</em>.</p>
+
+<h2>Closing</h2>
+
+<p>Production-readiness is not a single decision. It is the accumulation of small ones, each obvious in isolation and easy to skip individually. The cost of skipping shows up later, usually at 3 a.m., usually under load. The checklist exists so you do not have to remember any of this when you are tired.</p>
+
+<p>None of the items above are difficult. The discipline is in walking through all of them every time, even when the service "looks fine".</p>
+
+<div class="footnote">
+  <p>Orlando Burli Júnior is a Senior Software Engineer with 20+ years building distributed systems. He writes about Java, Spring Boot, GCP, and AI engineering at <a href="https://orlandoburli.com.br">orlandoburli.com.br</a>.</p>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Event-Sourced Recommendation Engines: Architecture from a Real System</title>
+  <meta name="description" content="Most recommendation tutorials show the model. Production recommendation systems live and die on the event pipeline. Here is the architecture of one we built — events, features, models, and the serving path."/>
+  <meta name="robots" content="noindex, nofollow"/>
+  <link rel="stylesheet" href="article.css"/>
+</head>
+<body>
+
+<h1>Event-Sourced Recommendation Engines</h1>
+<p class="dek">Tutorials show the model. Production recommendation systems live and die on the event pipeline. Here is the architecture of one we built — events, features, training, and the serving path.</p>
+
+<div class="byline">
+  <span><strong>Orlando Burli Júnior</strong> · Senior Software Engineer</span>
+  <span>· ~13 min read</span>
+</div>
+
+<div class="tldr">
+  <strong>TL;DR</strong>
+  A recommendation system is mostly a data pipeline with a model attached. Get the events right and the model is straightforward. Get the events wrong and no model can save you. This is the architecture of a production recommendation engine — a single source-of-truth event log, derived feature stores for offline and online use, periodic model training, and a low-latency serving path. The interesting decisions are at the seams between these components, not inside any one of them.
+</div>
+
+<h2>What we are recommending</h2>
+
+<p>The system this article is based on suggests next-best actions to customers — things they could do on the platform that align with their stated goals and prior behavior. Tens of thousands of users, millions of events per day, an inventory of a few hundred candidate actions. The model is a learning-to-rank classifier; the action space is small enough that we can score every candidate at request time. None of that detail is universal. The architecture around it is.</p>
+
+<h2>The architecture in one diagram</h2>
+
+<pre><code>+---------------+     +-----------+     +------------------+
+| Application   |---&gt;|  Pub/Sub  |---&gt;| Event log (BQ)   |
+| services      |     |  topic    |     | append-only      |
++---------------+     +-----------+     +--------+---------+
+                                                 |
+                                                 v
+                                        +------------------+
+                                        | Feature jobs     |
+                                        | (PySpark / DBT)  |
+                                        +--------+---------+
+                                                 |
+                          +----------------------+--------------+
+                          v                                     v
+                  +---------------+                    +---------------+
+                  | Offline store |                    | Online store  |
+                  | (BigQuery)    |                    | (Redis/BT)    |
+                  +-------+-------+                    +-------+-------+
+                          |                                    |
+                          v                                    v
+                  +---------------+                    +---------------+
+                  | Training      |                    | Serving       |
+                  | (Vertex AI)   |--&gt; model artifact -&gt;| (Spring Boot) |
+                  +---------------+                    +-------+-------+
+                                                              |
+                                                              v
+                                                       +---------------+
+                                                       | Application   |
+                                                       +---------------+
+</code></pre>
+
+<p>Five moving parts. Each replaceable. The contracts between them are the design.</p>
+
+<h2>The event log is the foundation</h2>
+
+<p>Every behavior signal the model could care about is a domain event published to a single Pub/Sub topic. The event schema is opinionated and small:</p>
+
+<pre><code>{
+  "event_id": "uuid",
+  "event_type": "ProductViewed",
+  "user_id": "u_123",
+  "occurred_at": "2026-04-18T10:13:25Z",
+  "ingested_at": "2026-04-18T10:13:26Z",
+  "session_id": "s_abc",
+  "properties": {
+    "product_id": "p_456",
+    "category": "contracts",
+    "source": "search"
+  },
+  "context": {
+    "platform": "web",
+    "country": "US",
+    "experiment_assignments": ["rec_v3:treatment"]
+  }
+}</code></pre>
+
+<p>A few intentional choices here:</p>
+
+<ul>
+  <li><strong>Both <code>occurred_at</code> and <code>ingested_at</code>.</strong> Late-arriving events are normal. Without both timestamps, you cannot tell whether a feature lookup is missing a recent event or a delayed one.</li>
+  <li><strong>Schema is event-type-shaped, not table-shaped.</strong> Properties are nested, not flattened columns. New event types do not require schema migrations downstream — just a new feature job.</li>
+  <li><strong>Experiment assignments in context.</strong> Critical for correctly attributing model predictions back to the cohort that was exposed to a given model version.</li>
+</ul>
+
+<p>The events flow into a partitioned BigQuery table via a Dataflow Pub/Sub-to-BigQuery template. The table is append-only. There are no updates, no deletes (compliance erasure happens via a separate pseudonymization step). This is the system of record for "what happened".</p>
+
+<h2>Features: the same logic, two stores</h2>
+
+<p>A recommendation model needs the same features in two places: at training time (offline, big batches) and at serving time (online, single user, low latency). The single biggest source of bugs in recommendation systems is the same feature being computed slightly differently in those two paths.</p>
+
+<p>The architectural answer is to write the feature logic once and materialize it into both stores. We did this with PySpark jobs that produce two outputs:</p>
+
+<ol>
+  <li>A BigQuery table partitioned by date for training.</li>
+  <li>A keyed write into Redis (or Bigtable, depending on the feature's TTL profile) for serving.</li>
+</ol>
+
+<p>The job runs on a schedule for batch features and as a streaming job for near-real-time features. The contract — column names, types, semantics — is identical in both stores.</p>
+
+<h3>Feature freshness as a first-class concern</h3>
+
+<p>Every feature has a documented freshness SLA. "Days since last login" is allowed to be up to 6 hours stale. "Pages viewed in current session" must be sub-second fresh. The freshness budget drives the implementation:</p>
+
+<table>
+  <tr>
+    <th>Freshness SLA</th>
+    <th>Implementation</th>
+  </tr>
+  <tr>
+    <td>Sub-second</td>
+    <td>Computed at request time from session state in Redis</td>
+  </tr>
+  <tr>
+    <td>Sub-minute</td>
+    <td>Streaming PySpark job consuming Pub/Sub, writing Redis</td>
+  </tr>
+  <tr>
+    <td>Sub-hour</td>
+    <td>Hourly batch from BigQuery, written to Redis with TTL</td>
+  </tr>
+  <tr>
+    <td>Daily</td>
+    <td>Nightly batch, served from BigQuery for training, Bigtable for serving</td>
+  </tr>
+</table>
+
+<p>The freshness column lives in a feature catalog that the data scientists own. New model features are not allowed in production without a documented SLA and a corresponding implementation tier.</p>
+
+<h2>Training and the offline / online consistency check</h2>
+
+<p>Training runs on Vertex AI on a weekly cadence. The training set is constructed by joining historical events to the materialized features, with a strict point-in-time correctness rule: a feature value used to train on event E must not include any signal from after E's <code>occurred_at</code>. Violating this is the most common form of "data leakage" and produces models that look great offline and fail in production.</p>
+
+<p>Two safeguards keep us honest:</p>
+
+<h3>1. Time-travel joins, not as-of joins on partition</h3>
+
+<p>The training query does not just join on date partitions. It uses an explicit <code>WHERE features.computed_at &lt;= events.occurred_at</code>, which respects the feature's actual computation time, not the partition it landed in. Partition-only joins can leak signal from late-arriving events.</p>
+
+<h3>2. Online / offline parity check</h3>
+
+<p>A nightly job samples 1,000 recent serving requests, looks up the features that were served, and re-derives them from the offline store at the same timestamp. The difference distribution is a metric. If it drifts above a threshold, an alert fires. We have caught two genuinely subtle bugs this way — both were race conditions in feature materialization that nothing else would have surfaced.</p>
+
+<h2>The serving path</h2>
+
+<p>The model is served by a Spring Boot service. A request looks like:</p>
+
+<ol>
+  <li>Receive a <code>recommend</code> call with a user ID and a context (page, intent).</li>
+  <li>Fetch the candidate set — typically a few hundred items, pre-filtered for eligibility (region, plan, content licensing, etc.).</li>
+  <li>Fetch the user's feature vector from Redis (single round-trip, all features in one hash).</li>
+  <li>Fetch the candidate-side features from Bigtable (one batched read for all candidates).</li>
+  <li>Score each candidate with the model.</li>
+  <li>Apply business rules (diversity quotas, blacklists, cooldowns).</li>
+  <li>Return the top N.</li>
+</ol>
+
+<p>Performance budget: 50 ms p95 end-to-end. The expensive parts are the Bigtable batched read and the model scoring. Both are bounded — a few hundred items times a few dozen features each. The model itself is a gradient-boosted tree exported as ONNX and run with the ONNX runtime; inference is sub-millisecond.</p>
+
+<pre><code>@Service
+@RequiredArgsConstructor
+public class RecommendationService {
+
+    private final CandidateProvider candidateProvider;
+    private final UserFeatureStore userFeatures;
+    private final ItemFeatureStore itemFeatures;
+    private final OnnxScorer scorer;
+    private final BusinessRules rules;
+    private final RecommendationLogger logger;
+
+    public List&lt;Recommendation&gt; recommend(String userId, RequestContext ctx) {
+        List&lt;String&gt; candidates = candidateProvider.eligible(userId, ctx);
+        UserFeatureVector userVec = userFeatures.fetch(userId);
+        Map&lt;String, ItemFeatureVector&gt; itemVecs = itemFeatures.batchFetch(candidates);
+
+        List&lt;ScoredCandidate&gt; scored = candidates.stream()
+            .map(c -&gt; new ScoredCandidate(c, scorer.score(userVec, itemVecs.get(c))))
+            .sorted(comparingDouble(ScoredCandidate::score).reversed())
+            .toList();
+
+        List&lt;Recommendation&gt; result = rules.apply(scored, ctx).stream()
+            .limit(ctx.requestedCount())
+            .toList();
+
+        logger.logRequest(userId, ctx, candidates, result);
+        return result;
+    }
+}</code></pre>
+
+<p>The <code>logger.logRequest</code> call is non-negotiable. Every served recommendation is logged with the candidate set, the scores, the user features at serving time, and the model version. This becomes training data for the next iteration and the audit trail for "why did the model recommend X?" debugging.</p>
+
+<h2>Experimentation is part of the architecture</h2>
+
+<p>Recommendation systems live or die by their ability to A/B test. Building experimentation in as a first-class concept rather than a bolt-on saves enormous pain later.</p>
+
+<p>The experiment framework integrates at three points:</p>
+
+<ol>
+  <li><strong>Assignment at request time</strong> — the user is bucketed deterministically into a treatment based on a stable hash of their ID, and the assignment is recorded in the request log.</li>
+  <li><strong>Treatment at scoring time</strong> — the assignment determines which model version (or candidate generator, or business rule set) is used.</li>
+  <li><strong>Analysis offline</strong> — the request log + downstream conversion events form the experiment data. A scheduled job computes the metrics that decide the experiment.</li>
+</ol>
+
+<p>This is intentionally generic. Any change to the system — a new model, a new feature, a different ranking rule — goes through the same experiment pipeline. There is no "this is too small to test" path; there is also no "we tested this in staging" excuse.</p>
+
+<h2>What breaks first</h2>
+
+<p>If you build a system like this, the first things to break tend to be:</p>
+
+<ol>
+  <li><strong>Feature freshness alerts</strong> as the streaming PySpark job lags behind a traffic spike. Mitigation: scale the streaming job on watermark lag, not CPU.</li>
+  <li><strong>Online / offline drift</strong> when a feature is renamed in one path but not the other. Mitigation: feature catalog as code, with CI checks that both stores produce the registered columns.</li>
+  <li><strong>Bigtable hot rows</strong> when a single popular item is in every candidate set and its feature row gets hammered. Mitigation: cache hot item features in the serving JVM with a short TTL.</li>
+  <li><strong>Model staleness</strong> as user behavior drifts but the training schedule does not catch up. Mitigation: monitor a stability metric on the input feature distributions and trigger early retraining when drift exceeds a threshold.</li>
+</ol>
+
+<p>None of these are model problems. All of them are pipeline problems. This is the recurring lesson of building these systems: the model is the easy part.</p>
+
+<h2>What we would do differently</h2>
+
+<ul>
+  <li><strong>Write the parity check first.</strong> The online / offline consistency job should exist before the first feature is served, even if it is checking a single feature. Adding it after the fact was harder than it should have been.</li>
+  <li><strong>One event topic, not many.</strong> We started with topic-per-event-type and consolidated later. The single topic with a discriminator field is dramatically easier to reason about.</li>
+  <li><strong>Treat the feature catalog as a contract.</strong> A markdown file is not a contract. A typed schema with CI enforcement is.</li>
+  <li><strong>Build the request logger before the first model.</strong> Without it, your first iteration of the model is also your first iteration of the dataset, and the second iteration cannot improve because there is no labeled data yet.</li>
+</ul>
+
+<h2>Closing</h2>
+
+<p>Recommendation systems get romanticized as model engineering. In production they are mostly data engineering with a thin model layer on top. The architecture choices that matter — event log shape, feature store split, request logging, experiment integration — are made early, persist for years, and determine how much pain you will have for the rest of the system's life.</p>
+
+<p>The model is the easy part. Everything around it is the architecture.</p>
+
+<div class="footnote">
+  <p>Orlando Burli Júnior is a Senior Software Engineer with 20+ years building distributed systems. He writes about Java, Spring Boot, GCP, and AI engineering at <a href="https://orlandoburli.com.br">orlandoburli.com.br</a>.</p>
+</div>
+
+</body>
+</html>

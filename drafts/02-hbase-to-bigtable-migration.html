@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Migrating an ERP from HBase to Google BigTable: Schema Patterns from Production</title>
+  <meta name="description" content="A practitioner's diary of migrating an ERP database from on-prem HBase to managed Google BigTable. Row-key design, hot-row mitigation, dual-write strategy, and what we wish we had known sooner."/>
+  <meta name="robots" content="noindex, nofollow"/>
+  <link rel="stylesheet" href="article.css"/>
+</head>
+<body>
+
+<h1>Migrating an ERP from HBase to Google BigTable</h1>
+<p class="dek">A practitioner's notes on moving years of operational data from on-prem HBase to managed BigTable. Row keys, hot rows, dual-writes, and the things the docs do not warn you about.</p>
+
+<div class="byline">
+  <span><strong>Orlando Burli Júnior</strong> · Senior Software Engineer</span>
+  <span>· ~12 min read</span>
+</div>
+
+<div class="tldr">
+  <strong>TL;DR</strong>
+  Migrating from HBase to BigTable is mostly a row-key redesign exercise, not a data copy. The Schema Translation Tool gets you a syntactically valid BigTable instance. It does not solve hot rows, ordering issues, the missing namespace concept, or the IAM rewrite. We did the migration over months using a dual-write phase and a verification job, not a big-bang cutover. Here are the patterns and pitfalls we hit.
+</div>
+
+<h2>Why we moved</h2>
+
+<p>The starting point was a self-managed HBase cluster behind an ERP that had grown organically for the better part of a decade. Region servers were tuned by hand. Major compactions were scheduled at 3 a.m. and watched by humans. Capacity planning meant arguing about disks every quarter. None of this was generating customer value.</p>
+
+<p>BigTable promised to remove the operational toil — autoscaling, no compactions to manage, IAM-native auth, integrations with the rest of GCP. The HBase API compatibility was the closer. On paper, you keep your client code and gain a managed backend.</p>
+
+<p>The reality is more nuanced. The wire protocol is compatible. The operational model and several semantic details are not.</p>
+
+<h2>Things that actually changed</h2>
+
+<p>Before touching code, the team built an inventory of every behavior we relied on. The list of things that changed turned out to be longer than expected:</p>
+
+<table>
+  <tr>
+    <th>HBase</th>
+    <th>BigTable</th>
+  </tr>
+  <tr>
+    <td>Namespaces for logical grouping and ACLs</td>
+    <td>No namespaces — encode the prefix in the table name; permissions via IAM</td>
+  </tr>
+  <tr>
+    <td>Server-side coprocessors</td>
+    <td>Not supported — push logic to the client</td>
+  </tr>
+  <tr>
+    <td>Per-table compression and encoding settings</td>
+    <td>Managed by BigTable, no knobs</td>
+  </tr>
+  <tr>
+    <td>Region-aware client behavior, manual splits</td>
+    <td>Automatic tablet splitting; pre-splits via key ranges only</td>
+  </tr>
+  <tr>
+    <td>HFile-level snapshots and snapshot exports</td>
+    <td>Backups (instance-level), no per-table snapshots in the same sense</td>
+  </tr>
+  <tr>
+    <td>Authentication via Kerberos / Ranger / custom auth</td>
+    <td>Service accounts and Cloud IAM roles</td>
+  </tr>
+</table>
+
+<p>None of these are blockers. All of them broke <em>something</em> on the way through.</p>
+
+<h2>The first thing to redesign: row keys</h2>
+
+<p>If you do nothing else, fix your row keys before you migrate. BigTable performance is dictated by row-key design more than any other single factor, and the patterns that work in HBase often translate poorly when your underlying storage is now globally distributed and tablet-balanced automatically.</p>
+
+<p>The original ERP used row keys like:</p>
+
+<pre><code>customer_id|invoice_id|line_item_id</code></pre>
+
+<p>Plain delimiter-joined fields. It worked on HBase because traffic was geographically concentrated and we had hand-tuned splits. It would have caused immediate hot tablets on BigTable: every active customer's traffic landed on the same key prefix, so a single tablet served a disproportionate share of writes.</p>
+
+<h3>Pattern 1: avoid monotonically increasing prefixes</h3>
+
+<p>Row keys are sorted lexicographically. If your prefix increases over time (timestamps, sequential IDs, increasing customer IDs), all new writes land at the tail of the keyspace, on a single tablet. This is the most common cause of hot tablets.</p>
+
+<p>The standard fix is a hash prefix:</p>
+
+<pre><code>// Before
+String key = invoiceId + "|" + lineItemId;
+
+// After
+String hashPrefix = String.format("%04x",
+    Hashing.murmur3_32_fixed().hashString(invoiceId, UTF_8).asInt() &amp; 0xFFFF);
+String key = hashPrefix + "|" + invoiceId + "|" + lineItemId;</code></pre>
+
+<p>This spreads writes across 65k logical buckets. Range scans on a specific invoice still work because the hash is deterministic. Range scans across all invoices in a date window become harder — that is the trade-off you accept in exchange for write distribution.</p>
+
+<h3>Pattern 2: reverse timestamps for "recent first" queries</h3>
+
+<p>If your access pattern is "give me the latest N events for this aggregate", encode the timestamp as <code>Long.MAX_VALUE - timestamp</code>. The lexicographic sort then naturally surfaces the newest rows first, and a <code>limit N</code> scan reads a tiny window at the start of that aggregate's keyspace:</p>
+
+<pre><code>String key = customerId + "|" + (Long.MAX_VALUE - eventTimestamp);</code></pre>
+
+<p>This is the difference between a 2 ms read and a 200 ms read once the aggregate has tens of thousands of events.</p>
+
+<h3>Pattern 3: cap the depth of a single row</h3>
+
+<p>BigTable rows can technically hold gigabytes of data. They should not. Best practice from Google and our hard-won experience: keep a single row under 100 MB, ideally under 10 MB. Wide rows cause unbalanced tablets and read amplification.</p>
+
+<p>For the ERP, this meant breaking up a "customer" row that historically held all related transactions into one row per transaction with the customer ID as a prefix. The client-side code joined on read, which is cheap when the rows are co-located on the same tablet.</p>
+
+<h2>Column families: redesign, do not copy</h2>
+
+<p>HBase teams often have many column families because they were free in the local cluster. BigTable charges you for each one in subtle ways: each column family is stored in a separate file group per tablet, so over-splitting your schema increases I/O on common reads.</p>
+
+<p>The migration was an excuse to consolidate. We collapsed our 6 column families to 3:</p>
+
+<ul>
+  <li><strong><code>cf_hot</code></strong> — fields read on every request (status, last update timestamp, denormalized customer name)</li>
+  <li><strong><code>cf_attrs</code></strong> — variable attributes that are read together but only on detail pages</li>
+  <li><strong><code>cf_audit</code></strong> — append-only audit columns with a 90-day GC policy</li>
+</ul>
+
+<p>The <code>cf_audit</code> family used a per-cell garbage collection policy, which BigTable supports natively. Audit data older than 90 days disappears automatically — no scheduled deletion job, no operational overhead.</p>
+
+<h2>The dual-write migration</h2>
+
+<p>Big-bang cutovers from a primary database are a bad idea. The migration ran in four phases, each of which lasted long enough to be confident before moving on:</p>
+
+<h3>Phase 1: backfill</h3>
+
+<p>A Dataflow job read snapshots from HBase, transformed row keys to the new design, and wrote into BigTable. Throughput was around 100k rows/second per worker; the full historical backfill took two weeks of wall-clock time.</p>
+
+<p>Two non-obvious things mattered here:</p>
+
+<ul>
+  <li><strong>Pre-split the destination tables</strong> using sample row keys from the new schema. Without pre-splits, the first hour of the backfill was rate-limited as BigTable split tablets reactively under load.</li>
+  <li><strong>Track watermark per source partition.</strong> Restartable jobs are non-negotiable when a single failure costs you days.</li>
+</ul>
+
+<h3>Phase 2: dual-write, single read</h3>
+
+<p>The application started writing to both HBase and BigTable inside the same business transaction (using the outbox pattern, by the way — see the <a href="01-outbox-spring-boot-pubsub.html">previous article</a>). Reads continued to go to HBase only. Any write inconsistency was a bug to fix, not a customer-visible problem.</p>
+
+<p>This phase ran for a month. A nightly verification job sampled 1% of recent writes and compared cell-by-cell. Discrepancies fell into three categories:</p>
+
+<ol>
+  <li><strong>Encoding bugs</strong> — different bytes for the same logical value (timestamp formats, charset issues). Fixed in the dual-write code.</li>
+  <li><strong>Race conditions</strong> — concurrent updates produced different last-writer-wins outcomes. We tightened the write path to serialize updates per row.</li>
+  <li><strong>Acceptable drift</strong> — server-set timestamps differing by milliseconds. Filtered out of the comparison.</li>
+</ol>
+
+<h3>Phase 3: shadow reads</h3>
+
+<p>The application started reading from BigTable in parallel with HBase, comparing results in the response path, but still serving the HBase result to the user. Mismatches were logged with the row key and a diff. We iterated until the mismatch rate fell below 0.001%.</p>
+
+<p>This phase caught the subtlest bugs: code paths that wrote to one column family but read from another, fields that were never properly migrated because they were "deprecated but in use".</p>
+
+<h3>Phase 4: cutover</h3>
+
+<p>Reads moved to BigTable. Writes continued to both for a further two weeks as a rollback insurance policy. After we were confident, HBase writes stopped, and the cluster was decommissioned a quarter later.</p>
+
+<h2>Operational learnings</h2>
+
+<p>The following were not in any documentation we read up front. They are the hard-earned kind:</p>
+
+<h3>Garbage collection policies are silent killers</h3>
+
+<p>BigTable applies cell-level GC asynchronously. If you set <code>maxVersions=1</code> on a column family that previously held many versions, deletes do not happen at write time — they happen during background compaction. For a few weeks, your storage bill reflects the old data and your reads pay the cost of skipping over tombstoned cells. Plan for it.</p>
+
+<h3>The Java client is opinionated</h3>
+
+<p>The HBase compatibility layer for BigTable wraps the gRPC client. Some HBase client patterns translate poorly:</p>
+
+<ul>
+  <li><strong>Bulk gets across many row keys</strong> — HBase batches them in a single RPC; BigTable's compatibility layer fans them out. Use the native <code>bulkRead</code> API for hot paths.</li>
+  <li><strong>Filters with regex</strong> — supported, but evaluated server-side in a way that does not benefit from the row-key sort. Push as much specificity into the row-key prefix as possible.</li>
+</ul>
+
+<h3>IAM is not Ranger</h3>
+
+<p>If your HBase deployment had row-level or column-level ACLs via Ranger, BigTable does not have an equivalent. You authorize at the table level. Anything finer-grained becomes an application concern — a service account that can read the whole table but the application enforces tenant scoping in the request handler. Inventory your existing ACLs early; they often reveal access patterns you forgot you had.</p>
+
+<h3>Cost behaves differently</h3>
+
+<p>HBase costs were "the cluster is the cluster" — relatively flat, dominated by hardware. BigTable cost is node-hours plus storage plus network egress. The first month of production looked great because the autoscaler was conservative. The second month spiked because a new feature triggered scans across the whole keyspace. We added a budget alert and a per-job limit on read units.</p>
+
+<h2>What we would do differently</h2>
+
+<ol>
+  <li><strong>Redesign row keys before backfill, not during.</strong> We started backfilling with a "close enough" key design and had to redo a chunk of it. The cost of getting this wrong is a second backfill.</li>
+  <li><strong>Pre-split aggressively.</strong> Over-splitting is cheap; under-splitting causes hot tablets that are painful to fix retroactively.</li>
+  <li><strong>Build the verification job on day one.</strong> Cell-level comparison saved us at least three production incidents. It should have existed before the first dual-write went live.</li>
+  <li><strong>Document the access patterns.</strong> Half the row-key disagreements in the team came from people imagining different read patterns. A simple spreadsheet of "query → expected latency → row-key shape" would have shortened the design phase.</li>
+  <li><strong>Set the budget alert before anything else.</strong> The first cost surprise costs the most political capital.</li>
+</ol>
+
+<h2>Closing</h2>
+
+<p>BigTable is a different database than HBase wearing a familiar wire protocol. The migration succeeded because the team treated it as a database redesign with a long verification phase, not a lift-and-shift. Anyone planning a similar move: assume you will spend most of the calendar time on row-key design and verification, not on the actual data copy. Budget accordingly.</p>
+
+<p>In the next article I will share five things production RAG systems do that the tutorials skip — chunking, reranking, cost control, hallucination defenses, and the evaluation loop. All from a year of running Gemini in front of real customers.</p>
+
+<div class="footnote">
+  <p>Orlando Burli Júnior is a Senior Software Engineer with 20+ years building distributed systems. He writes about Java, Spring Boot, GCP, and AI engineering at <a href="https://orlandoburli.com.br">orlandoburli.com.br</a>.</p>
+</div>
+
+</body>
+</html>

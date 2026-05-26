@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Apigee Edge to Apigee X: A Practitioner's Migration Diary</title>
+  <meta name="description" content="A practitioner's account of migrating an API platform from Apigee Edge to Apigee X. Networking, KVM secrets, shared flows, deployment models, and the things the migration tools cannot do for you."/>
+  <meta name="robots" content="noindex, nofollow"/>
+  <link rel="stylesheet" href="article.css"/>
+</head>
+<body>
+
+<h1>Apigee Edge to Apigee X: A Practitioner's Migration Diary</h1>
+<p class="dek">The vendor blogs all read like sales pitches. This one is from the engineering side — what actually broke, what the tooling could not do for us, and the lessons that should have been in the docs.</p>
+
+<div class="byline">
+  <span><strong>Orlando Burli Júnior</strong> · Senior Software Engineer</span>
+  <span>· ~10 min read</span>
+</div>
+
+<div class="tldr">
+  <strong>TL;DR</strong>
+  Apigee X is not a drop-in replacement for Apigee Edge. The proxies look the same, the tools convert most artifacts, and demos work in a sandbox. Then production hits networking, encrypted KVMs, shared flow ordering, and the new deployment model. The migration takes weeks of engineering, not the days the migration guide implies. Here is what we hit and how we worked through it.
+</div>
+
+<h2>Why we migrated</h2>
+
+<p>Google has been clear that Edge is end-of-life. The choice was not whether to migrate, only when. The driver in our case was a combination of the deprecation timeline and the desire to consolidate API management onto the same GCP project as the rest of our platform. The latter sounded like a small operational benefit. It turned out to be the cleanest part of the move.</p>
+
+<p>Everything else took longer than expected. Below are the surprises, in roughly the order we discovered them.</p>
+
+<h2>Apigee X is a different deployment topology</h2>
+
+<p>Apigee Edge runs as a multi-tenant SaaS with a clear "organization → environment → proxy" hierarchy. Apigee X runs inside your VPC, fronted by a Google-managed load balancer, with environments mapped to <em>environment groups</em> that own hostnames. The conceptual change is more significant than it sounds.</p>
+
+<p>The first practical implication: every environment in X needs a hostname allocated to an environment group, and the load balancer needs that hostname configured. On Edge, environments and hostnames were essentially interchangeable. On X, you can have an environment that is not reachable from the internet because no environment group binds it. This caught us during the first few proxy deployments — proxies deployed cleanly, returned no errors, and were unreachable.</p>
+
+<p>The fix is mechanical but not obvious from the UI: deploy the proxy <em>and</em> verify the environment group routing rule exists for the hostname the client is hitting.</p>
+
+<h2>The Schema Translation Tool gets you 80%</h2>
+
+<p>The official <code>apigeecli</code> and the related <code>apigee-migrate-edge-to-x-tools</code> repository handle most of the proxy artifact conversion: API proxies, shared flows, target servers, KVMs (the metadata, not the encrypted contents), and developer apps. Run them, get a directory of converted bundles, deploy.</p>
+
+<p>The 20% that does not convert is where the migration time goes:</p>
+
+<ul>
+  <li><strong>Encrypted KVM entries.</strong> Edge encrypts these server-side and you cannot export the plaintext. You re-create them in X by hand or via your secret store. Inventory every encrypted KVM before starting; surprises here block deployments.</li>
+  <li><strong>Keystores and certificates.</strong> Same as KVMs. The tool migrates the references, not the contents. We rotated all certificates as part of the move because re-uploading old PEMs felt wasteful.</li>
+  <li><strong>Custom JavaScript / Python / Java callouts.</strong> These convert syntactically. Whether they still work depends on the runtime version differences. Plan to run your full integration test suite against X before flipping any traffic.</li>
+  <li><strong>Analytics and custom reports.</strong> Do not migrate. Apigee X uses a different analytics backend with a different schema. If you have dashboards in Looker / Sumologic / wherever, expect to rebuild them.</li>
+</ul>
+
+<h2>Shared flow dependency ordering</h2>
+
+<p>This one cost us a full day of debugging. In Apigee Edge, shared flows reference each other and the platform resolves the order at deploy time. In Apigee X, the deploy order is your responsibility. If a proxy references a shared flow that is not yet deployed in the target environment, the deploy fails with a generic resolution error.</p>
+
+<p>The migration tool does not topologically sort your shared flows. We wrote a small script to do it:</p>
+
+<pre><code>#!/usr/bin/env python3
+"""Resolve shared-flow dependency order for Apigee X deploys."""
+import os, re
+from pathlib import Path
+from graphlib import TopologicalSorter
+
+SHARED_FLOW_REF = re.compile(r'&lt;SharedFlowBundle&gt;([^&lt;]+)&lt;/SharedFlowBundle&gt;')
+
+def find_dependencies(bundle_dir: Path) -&gt; set[str]:
+    deps = set()
+    for xml in bundle_dir.rglob("*.xml"):
+        for match in SHARED_FLOW_REF.finditer(xml.read_text()):
+            deps.add(match.group(1))
+    return deps
+
+def order(bundles_root: Path) -&gt; list[str]:
+    graph = {}
+    for bundle in bundles_root.iterdir():
+        if not bundle.is_dir():
+            continue
+        graph[bundle.name] = find_dependencies(bundle)
+    return list(TopologicalSorter(graph).static_order())
+
+if __name__ == "__main__":
+    for name in order(Path("./shared-flows")):
+        print(name)
+</code></pre>
+
+<p>Pipe its output into the deploy command. Boring, defensive, saves hours.</p>
+
+<h2>Developer email case sensitivity</h2>
+
+<p>Apigee Edge treats <code>User@example.com</code> and <code>user@example.com</code> as different developers. Apigee X normalizes to lowercase. If your developer portal has years of organic registrations, you almost certainly have collisions waiting in the export.</p>
+
+<p>The mitigation is to pre-process the developer export, identify collisions, and decide on a merge strategy <em>before</em> the import. We had three categories:</p>
+
+<ol>
+  <li><strong>Inactive duplicates</strong> — the lowercase user had no apps; we dropped the uppercase version.</li>
+  <li><strong>Active duplicates</strong> — both had apps; we merged apps onto the lowercase developer and emailed the affected user.</li>
+  <li><strong>Genuine same-person re-registrations</strong> — easy merge, no notification needed.</li>
+</ol>
+
+<p>Discover these on day one of the migration. The decision tree is a stakeholder conversation, not an engineering one.</p>
+
+<h2>The new deployment model</h2>
+
+<p>On Edge, you push a proxy bundle and it is live. On X, deployment is a two-step process: <em>upload a revision</em> and <em>deploy that revision to an environment</em>. The split is good — it lets you stage revisions before activating — but it breaks every CI/CD script that assumed a single API call.</p>
+
+<p>Our existing GitLab pipeline looked roughly like this for Edge:</p>
+
+<pre><code>deploy_edge:
+  script:
+    - apigee-deploy --org $ORG --env $ENV --bundle ./proxy.zip</code></pre>
+
+<p>The X equivalent is:</p>
+
+<pre><code>deploy_x:
+  script:
+    - REV=$(apigeecli apis create bundle -f ./proxy.zip -n $PROXY -o $ORG --output json | jq -r .revision)
+    - apigeecli apis deploy -n $PROXY -e $ENV -v $REV -o $ORG --override
+    - apigeecli apis wait -n $PROXY -e $ENV -v $REV -o $ORG</code></pre>
+
+<p>The <code>--override</code> flag deploys without the deprecated "force" semantics. The <code>wait</code> command blocks until the new revision is fully serving traffic. Both are non-obvious from the docs and both prevent silent half-deploys.</p>
+
+<h2>Networking is now your problem</h2>
+
+<p>Apigee X runs in a peered VPC. Inbound traffic flows through a Google-managed external load balancer. Outbound traffic from your proxies to backend services flows through the VPC. If your backends are on the public internet, you need a NAT gateway. If your backends are in another VPC, you need peering or a VPN.</p>
+
+<p>We had a backend living in a different GCP project than the Apigee X project. The first deploy worked locally (because our test traffic came from inside the VPC). It failed in production because we had not set up the VPC peering between the two projects. The error was generic — "upstream connection error" — and the fix was infrastructure, not API code.</p>
+
+<p>If you take one piece of advice from this article: have your network team in the migration kickoff meeting. The most expensive surprises in this migration were networking surprises.</p>
+
+<h2>Quotas and traffic management</h2>
+
+<p>Apigee X quota counters work differently. Edge stored counters in the platform's distributed cache. X uses a regional store that is more consistent but slightly slower. For high-throughput APIs (more than a few thousand requests per second), the additional latency is measurable. The fix is usually to scope the quota counter to a smaller surface (per-app rather than per-developer, for instance) so the contention drops.</p>
+
+<p>Spike arrests behave the same way semantically but trigger differently in burst patterns. Re-tune your spike arrest thresholds based on production traffic samples after the cutover, not before.</p>
+
+<h2>The cutover itself</h2>
+
+<p>We did the cutover at the load balancer. Apigee X had been running in parallel for weeks, mirroring traffic via a small percentage canary. The actual cutover was a DNS / load balancer weight change executed during a planned change window:</p>
+
+<ol>
+  <li>Move 10% of traffic to X; watch error rate, latency, and quota counter behavior for 30 minutes.</li>
+  <li>Move 50%; watch for 30 minutes.</li>
+  <li>Move 100%; watch for 24 hours with on-call coverage.</li>
+  <li>Decommission Edge proxies after a 30-day grace period in case rollback was needed.</li>
+</ol>
+
+<p>The mechanics took an afternoon. The preparation took six weeks. That ratio felt right by the end.</p>
+
+<h2>What we wish we had known</h2>
+
+<ol>
+  <li><strong>Encrypted KVM contents are unrecoverable.</strong> Inventory and re-create them via your secret store before you start. Do not rely on the migration tool.</li>
+  <li><strong>Network plumbing is the longest pole.</strong> Get peering, NAT, and load balancer hostname mappings landed before any proxy migration work.</li>
+  <li><strong>Test the deploy pipeline with a trivial proxy first.</strong> A "hello world" proxy through the full CI/CD path catches the upload-vs-deploy split, the wait semantics, and the credentials issues without contaminating real traffic.</li>
+  <li><strong>Do the developer email normalization before the import.</strong> Cleaning up duplicates after the fact is harder.</li>
+  <li><strong>Plan to rebuild dashboards.</strong> The analytics differences mean any custom reports need a rewrite. Budget the time.</li>
+</ol>
+
+<h2>Closing</h2>
+
+<p>Apigee X is a better platform than Edge for most teams running on GCP — the IAM integration, the VPC-native networking, the unified billing, and the modern deploy model are all real wins. None of those wins are free. The migration is a real project with real engineering effort, not a tooling exercise. Plan it like one.</p>
+
+<p>The vendor blogs make it sound easy because their incentive is to keep customers from running away. The engineering reality is more nuanced. None of this should stop a migration — Edge is being deprecated regardless — but going in with realistic expectations makes the experience much less frustrating.</p>
+
+<div class="footnote">
+  <p>Orlando Burli Júnior is a Senior Software Engineer with 20+ years building distributed systems. He writes about Java, Spring Boot, GCP, and AI engineering at <a href="https://orlandoburli.com.br">orlandoburli.com.br</a>.</p>
+</div>
+
+</body>
+</html>

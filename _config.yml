@@ -1,1 +1,7 @@
 theme: jekyll-theme-architect
+
+# Drafts are kept publishable so Medium's "Import a story" can fetch them
+# via URL, but they are excluded from the sitemap and robots.txt blocks
+# crawlers from indexing them. Each draft also carries a noindex meta tag.
+keep_files:
+  - drafts

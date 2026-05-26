@@ -161,6 +161,10 @@ a.project-card{cursor:pointer}
 .blog-card p{font-size:.85rem;color:var(--gray-600);margin-bottom:.8rem}
 .blog-cta{font-size:.8rem;color:var(--accent);font-weight:500;display:flex;align-items:center;gap:.3rem;transition:gap .2s}
 .blog-card:hover .blog-cta{gap:.6rem}
+.blog-card-upcoming{cursor:default;border-style:dashed;background:linear-gradient(180deg,#fff,#fafafa)}
+.blog-card-upcoming:hover{transform:translateY(0) !important;box-shadow:none;border-color:var(--gray-200)}
+.blog-soon{background:#fef3c7;color:#92400e}
+.blog-cta-soon{font-size:.8rem;color:var(--gray-600);font-weight:500;display:flex;align-items:center;gap:.3rem}
 .blog-more{text-align:center;margin-top:2rem}
 .btn{display:inline-flex;align-items:center;gap:.5rem;padding:.7rem 1.5rem;background:var(--accent);color:#fff;border-radius:var(--radius);font-size:.9rem;font-weight:500;transition:all .25s}
 .btn:hover{background:#1d4ed8;transform:translateY(-2px);box-shadow:0 4px 20px rgba(37,99,235,.3)}
