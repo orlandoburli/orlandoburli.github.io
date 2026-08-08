@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Asking the Pipeline How It's Doing: Self-Improving Agent Orchestration</title>
+  <meta name="description" content="Apiary records everything its agents do and only ever used it to debug single tasks. The new improve command mines the whole history — with every number computed in Go before a model is ever asked for an opinion."/>
+  <meta name="robots" content="noindex, nofollow"/>
+  <link rel="stylesheet" href="article.css"/>
+</head>
+<body>
+
+<h1>Asking the Pipeline How It's Doing</h1>
+<p class="dek">Apiary now mines its own execution history and proposes changes to your agents, workflows and prompts — with every number computed before the model is ever asked for an opinion.</p>
+
+<div class="byline">
+  <span><strong>Orlando Burli Júnior</strong> · Senior Software Engineer</span>
+  <span>· ~9 min read</span>
+</div>
+
+<div class="tldr">
+  <strong>TL;DR</strong>
+  Apiary has logged every agent run for a year — timings, tokens, cost, transcripts — and used all of it to answer exactly one question: what happened to this task? The new <code>apiary improve</code> command asks the cross-cutting one instead. The evidence pack is computed entirely in Go, so no model ever produces a number; the model only reads them and proposes a patch, which then has to clear a five-stage validation gate. While building it, it found a bug in itself that my tests had missed.
+</div>
+
+<p>Apiary has recorded everything its agents do since more or less the first week. Timings, tokens, cost, turn counts, failure kinds, a full markdown transcript of every session. All of it queryable, all of it sitting in a SQLite file next to the config.</p>
+
+<p>And for a year, every single one of those rows only ever answered one question: <em>what happened to this task?</em> You open the dashboard because a run failed, you look at the step, you read the transcript, you fix the thing. Then you close it and the data goes back to sleep.</p>
+
+<p>The question nobody was asking is the cross-cutting one. Not <em>what happened to task #2081</em>, but: across the last two hundred runs, which step burns money for nothing? Which agent's instructions keep producing work that gets thrown away? Which branch of my workflow has never executed at all?</p>
+
+<p>That data was always there. <code>apiary improve</code> is the thing that finally reads it.</p>
+
+<h2>The numbers come first, and the model never touches them</h2>
+
+<p>The design constraint I set myself early was this: <strong>no model produces any number.</strong></p>
+
+<p>Everything measurable is computed in Go, deterministically, before an agent is involved. Per-step success rates, duration percentiles, cost, cache reuse, prompt weight, how often a step fell through to a fallback runner. Per-workflow terminal states and cost per completed instance. <code>max_turns</code> saturation. Wait polling. Failure messages normalized — UUIDs, timestamps, paths and durations scrubbed — so that forty distinct-looking errors collapse into the three actual bugs. Config that never executed.</p>
+
+<p>That whole bundle is the <em>evidence pack</em>, and you can look at it without running a model at all:</p>
+
+<pre><code>apiary improve --dump-evidence</code></pre>
+
+<p>Same database, same window, same JSON, every time. It is free and it is a perfectly good diagnostic on its own — I have used it more than once just to answer "is this step actually slow or does it only feel slow."</p>
+
+<p>The model's job is narrow by construction: read the numbers, explain them, propose a change. It does not get to invent a statistic to support an argument, because it never had the arithmetic in the first place.</p>
+
+<p>My favorite metric in there is <strong>rework loops</strong> — the same step running twice within one workflow instance. That is the fingerprint of an <code>on_fail</code>/<code>goto</code> cycle: an agent produced something a later gate rejected, so the pipeline went back and did it again. It looks like success in every status view, because the instance eventually completes. It is just quietly billed twice. Now it is priced and reported.</p>
+
+<h2>The gate, and why a patch is refused rather than fudged</h2>
+
+<p>A proposal is only interesting if it is applicable, so every one of them clears five stages before it reaches your terminal: the path resolves, the patch applies cleanly, the patched config parses and validates, expressions still lint, and any new warnings get surfaced.</p>
+
+<p>Patch application does <strong>no fuzzy matching</strong>, deliberately. A hunk whose context does not match is rejected outright. A patch that lands in approximately the right place is far worse than one that does not land at all — the first quietly corrupts a workflow, the second just prints a message.</p>
+
+<p>Rejected proposals are still shown, with the reason. The observation behind a patch that failed to apply is often perfectly sound and worth doing by hand.</p>
+
+<h2>The honest bit about souls and skills</h2>
+
+<p><code>improve</code> analyzes everything: <code>apiary.yaml</code>, workflow files, agent souls, skills. That was a deliberate scope decision — most of what makes an agent good or bad is prose, not YAML.</p>
+
+<p>But it means the validation gate has an uncomfortable asymmetry. A workflow patch can be <em>verified</em>: it parses, it validates, the expressions lint. A patch to a soul file clears "the patch applies" and absolutely nothing else. There is no mechanical check for whether a rewritten instruction makes an agent better.</p>
+
+<p>Rather than paper over that, the diff labels it per file. If a change could not be checked, it says so.</p>
+
+<p>Which is exactly why <code>apiary improve effect</code> exists. It recomputes the metrics that justified an applied change and reports the before/after delta:</p>
+
+<pre><code>apiary improve effect</code></pre>
+
+<p>For a prose edit, those numbers are the first real evidence in either direction — including the evidence that the change made things worse.</p>
+
+<h2>Apply writes files. Git is the undo.</h2>
+
+<pre><code>apiary improve --apply</code></pre>
+
+<p>There are no backups, no snapshots, no <code>apiary improve revert</code>. I thought about building them and then did not, because <code>git diff</code> and <code>git checkout</code> already do that job better than anything I would write. Keep your config in a repo and you have a complete undo story that you already know how to drive.</p>
+
+<p>What apply <em>does</em> owe you is an accurate account of what it touched — which files changed, which of them nothing could validate, and whether the daemon needs a restart. That it gives you.</p>
+
+<h2>The bug the advisor found before my tests did</h2>
+
+<p>While building this I ran it against Apiary's own database. It came back with a finding I was not expecting: the transcripts it was being shown did not match the steps it was supposed to be analyzing.</p>
+
+<p>It was right. The sampler picked each task's most recently <em>modified</em> transcript file, which — since transcripts are written as steps complete — is always the final step of the run. Every hotspot in the evidence pack was being illustrated with the wrong session. My tests did not catch it because they asserted a transcript was attached, not that it was the correct one.</p>
+
+<p>That is fixed, and it is the single best argument I have for the whole feature. Not "the AI wrote my config for me" — it did not and should not — but that aggregate execution data contains things you will not find by staring at individual runs, because the whole problem is that individually every one of them looked fine.</p>
+
+<h2>Where the minutes went</h2>
+
+<p>Shipping alongside it: <strong>per-step wall-clock attribution</strong>. Thinking, writing, tool waits and background tasks are now recorded next to the token columns, along with the slowest individual calls.</p>
+
+<pre><code>apiary profile &lt;instance-id&gt;</code></pre>
+
+<p>A step that is 80% tool waits has a completely different problem from one that is 80% thinking — the first is an environment or permissions issue, the second is a prompt issue. Until now the only number available was "it took 41 minutes", which told you nothing about which of those to go fix.</p>
+
+<p>Also in this release: <code>ack_via_silence</code> and <code>interrupt_on_resolve</code> for Prometheus, <code>dispatch_by: group</code> for Alertmanager, and a <code>stall_timeout</code> that measures <em>silence</em> rather than total duration — so a step streaming tool calls for ninety minutes survives, and one that has been quiet for twenty does not.</p>
+
+<h2>What I do not know yet</h2>
+
+<p>The deterministic half of this — the evidence pack, the validation gate, the ledger — is well covered by tests, and I trust it.</p>
+
+<p>The advisor's <em>judgement</em> has had four real runs, all of them mine, all against one database. That is not enough to know how good its suggestions are. It is precisely why the diff is the default and <code>--apply</code> is opt-in, and why the release notes say the same thing in the same words. Read what it proposes before you take it.</p>
+
+<p>If you run it against a database with some real history behind it, I would genuinely like to know what it told you — and especially where it was wrong.</p>
+
+<hr/>
+
+<pre><code>brew install --cask orlandoburli/tap/apiary
+apiary improve --dump-evidence</code></pre>
+
+<p>Apiary is open source and MIT-licensed: <a href="https://github.com/orlandoburli/apiary">github.com/orlandoburli/apiary</a>. The self-improvement docs are <a href="https://orlandoburli.github.io/apiary/improve/">here</a>, and v0.14.0 is <a href="https://github.com/orlandoburli/apiary/releases/tag/v0.14.0">here</a>.</p>
+
+<div class="footnote">
+  <p>Orlando Burli Júnior is a Senior Software Engineer with 20+ years building distributed systems. He writes about Java, Spring Boot, GCP, and AI engineering at <a href="https://orlandoburli.com.br">orlandoburli.com.br</a>.</p>
+</div>
+
+</body>
+</html>
